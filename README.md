@@ -9,7 +9,8 @@ One self-contained PowerShell script. No modules to install, no runtime to deplo
 ```
 
 ![Overview](docs/Overview.png)
-
+![Resiliency](docs/Resiliency.png)
+![Drives](docs/Drives.png)
 ---
 
 ## Why
