@@ -8,7 +8,7 @@ One self-contained PowerShell script. No modules to install, no runtime to deplo
 .\StorageSpacesDashboard.ps1
 ```
 
-![Overview](docs/overview.png)
+![Overview](docs/Overview.png)
 
 ---
 
