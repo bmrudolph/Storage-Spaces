@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Realtime web dashboard for a standalone Windows Storage Spaces subsystem.
 
@@ -34,6 +34,7 @@
 param(
     [int]    $Port        = 8080,
     [switch] $BindAll,          # bind http://+:Port/ instead of localhost (LAN access)
+    [switch] $NoEventLog,       # don't mirror state changes to the Windows event log
     [switch] $IncludeWear = $true,   # gather SSD wear/temp (slower; needs admin)
     [switch] $NoLaunch,         # do not auto-open the browser
     [int]    $SampleMs    = 100, # background perf-counter sampling cadence (ms)
@@ -96,6 +97,47 @@ $script:Shared = [hashtable]::Synchronized(@{
     wear     = @{}      # uniqueId -> {wear,temp}  (built by wear thread)
     wearProgress = $null # {done,total} while the SMART sweep is in flight
     layout   = @()      # slab placement per vdisk (built by layout thread)
+    # ---- event timeline -------------------------------------------------
+    # During triage, ORDERING IS CAUSALITY. "The drive went first, then the
+    # space degraded, then the repair started" is a different incident from
+    # "the repair started, then the space degraded". The dashboard could show
+    # the current state of everything and never once tell you what happened
+    # first.
+    #
+    # Lives on the SERVER, not in the browser: an incident you are diagnosing
+    # is exactly when you reload the page, and a client-side log would be born
+    # empty at that moment. Bounded, in-memory, dies with the process — no
+    # file, no database, no retention policy, nothing that could itself break.
+    events    = @()     # newest last; {t, sev, kind, name, from, to}
+    evPrev    = $null   # last observed state map, for diffing
+    evtLog    = $false  # true once the Application-log source is registered
+    # ---- server-side history ------------------------------------------------
+    # 1Hz downsample of the realtime feed, so a dashboard opened mid-incident
+    # arrives with a past instead of a blank chart. Lists (not arrays): "$a +="
+    # is O(n^2) and this is touched every second forever.
+    histMax   = 900     # 15 minutes at 1Hz
+    hist      = @{ t=[System.Collections.Generic.List[double]]::new()
+                   r=[System.Collections.Generic.List[double]]::new()
+                   w=[System.Collections.Generic.List[double]]::new()
+                   i=[System.Collections.Generic.List[double]]::new()
+                   d=@{} }
+    histAcc   = @{ since=[datetime]::UtcNow; n=0; r=0.0; w=0.0; i=0.0; d=@{} }
+    # Pool allocation over time, for the capacity forecast. One point a minute
+    # is ample for a trend measured in days.
+    capHist   = @{}     # poolName -> List of @{t,alloc,size}
+    # drive serial (or uniqueId) -> human bay label, e.g. "shelf 2 bay 7".
+    # Loaded from bays.json beside the script; the ONE piece of state this tool
+    # keeps on disk, because it is knowledge only a human standing in front of
+    # the hardware can supply and it must survive a restart.
+    bays      = @{}
+    # Drive identify LED. { uniqueId, until } — the topology collector turns it
+    # back off when the deadline passes, so a light can never be left on.
+    identify  = $null
+    # Triage rule key -> 'hidden' | 'info' | 'warn'. Lets you tell the dashboard
+    # that a given finding is not an emergency ON THIS MACHINE. Persisted to
+    # alerts.json so the judgement survives a restart. Suppressed findings are
+    # never silently dropped — the count is always on screen.
+    alerts    = @{}
     stop     = $false   # cooperative shutdown signal for every collector
     # Background runspaces have no console of their own, so they queue diagnostic
     # lines here and the main HTTP loop prints them.
@@ -163,14 +205,27 @@ $SamplerScript = {
             foreach ($inst in $counters.Keys) {
                 $per  = $counters[$inst]
                 $vals = @{}
+                # A counter that throws means "I don't know", NOT "zero". The old
+                # code fell back to 0.0 for every metric, which for '% Idle Time'
+                # made busy = 100 - 0 = 100 — so a drive whose counter instance had
+                # vanished (i.e. the drive was PULLED) rendered pegged at 100% busy
+                # for up to the 120s rebuild, then silently disappeared from the
+                # table. Neither state said "failed". Track the failure instead.
+                $ctrOk = $true
                 foreach ($d in $defs) {
-                    $v = 0.0
-                    if ($per.ContainsKey($d.k)) { try { $v = [double]$per[$d.k].NextValue() } catch { $v = 0.0 } }
+                    $v = $null
+                    if ($per.ContainsKey($d.k)) { try { $v = [double]$per[$d.k].NextValue() } catch { $v = $null } }
+                    else { $v = $null }
+                    if ($null -eq $v) { $ctrOk = $false; $v = [double]0 }
                     $vals[$d.k] = $v
                 }
-                $busy = 100 - $vals['idle']
-                if ($busy -lt 0)   { $busy = 0 }
-                if ($busy -gt 100) { $busy = 100 }
+                if ($ctrOk) {
+                    $busy = 100 - $vals['idle']
+                    if ($busy -lt 0)   { $busy = 0 }
+                    if ($busy -gt 100) { $busy = 100 }
+                } else {
+                    $busy = $null   # UI renders "?" — never 0 (calm) and never 100 (alarm)
+                }
                 $num  = ($inst -split '\s+')[0]
                 $meta = if ($map) { $map["$num"] } else { $null }
                 $list.Add([pscustomobject]@{
@@ -182,7 +237,8 @@ $SamplerScript = {
                     kind           = if ($meta) { $meta.Kind }      else { 'unmapped' }
                     busType        = if ($meta) { "$($meta.BusType)" } else { '' }
                     isSystem       = if ($meta) { [bool]$meta.IsSystem } else { $false }
-                    busy           = [math]::Round($busy, 1)
+                    countersOk     = $ctrOk
+                    busy           = if ($null -eq $busy) { $null } else { [math]::Round($busy, 1) }
                     readBps        = [math]::Round($vals['readBps'], 0)
                     writeBps       = [math]::Round($vals['writeBps'], 0)
                     reads          = [math]::Round($vals['reads'], 0)
@@ -217,13 +273,67 @@ $SamplerScript = {
                 jobs      = @($jobs)
             }
             $Shared['perfJson'] = ($resp | ConvertTo-Json -Depth 6 -Compress)
+
+            # ---- server-side history ring ---------------------------------
+            # Every number this dashboard has ever drawn lived in a browser ring
+            # buffer that dies with the tab. So you would open the dashboard
+            # DURING an incident and arrive with an empty chart, at the exact
+            # moment the only question that matters is "what did the last
+            # fifteen minutes look like?" — the tool had the least history
+            # precisely when history was worth the most.
+            #
+            # The server has been sampling since boot. Keep a downsampled copy.
+            # 1Hz for 15 minutes: 900 points per series, well under a megabyte
+            # even on a 37-drive pool. In memory, bounded by construction, dies
+            # with the process. No file, no schema, no retention policy, and
+            # nothing that could itself be the thing that is broken.
+            $now = [datetime]::UtcNow
+            $acc = $Shared['histAcc']
+            $acc['n']++
+            $acc['r'] += [double]$totR; $acc['w'] += [double]$totW; $acc['i'] += [double]$totI
+            foreach ($p in $phys) {
+                $k = "$($p.diskNumber)"
+                if (-not $acc['d'].ContainsKey($k)) { $acc['d'][$k] = @{ n=0; busy=0.0; r=0.0; w=0.0 } }
+                $dd = $acc['d'][$k]
+                $dd['n']++
+                if ($null -ne $p.busy) { $dd['busy'] += [double]$p.busy }
+                $dd['r'] += [double]$p.readBps; $dd['w'] += [double]$p.writeBps
+            }
+
+            if (($now - $acc['since']).TotalMilliseconds -ge 1000) {
+                $h = $Shared['hist']
+                $n = [math]::Max(1, $acc['n'])
+                [void]$h['t'].Add([math]::Round(($now - [datetime]'1970-01-01').TotalSeconds))
+                [void]$h['r'].Add([math]::Round($acc['r']/$n, 0))
+                [void]$h['w'].Add([math]::Round($acc['w']/$n, 0))
+                [void]$h['i'].Add([math]::Round($acc['i']/$n, 0))
+                foreach ($k in $acc['d'].Keys) {
+                    if (-not $h['d'].ContainsKey($k)) {
+                        $h['d'][$k] = @{ busy=[System.Collections.Generic.List[double]]::new()
+                                         r   =[System.Collections.Generic.List[double]]::new()
+                                         w   =[System.Collections.Generic.List[double]]::new() }
+                    }
+                    $dd = $acc['d'][$k]; $dn = [math]::Max(1, $dd['n'])
+                    [void]$h['d'][$k]['busy'].Add([math]::Round($dd['busy']/$dn, 1))
+                    [void]$h['d'][$k]['r'].Add([math]::Round($dd['r']/$dn, 0))
+                    [void]$h['d'][$k]['w'].Add([math]::Round($dd['w']/$dn, 0))
+                }
+                # Trim in one RemoveRange rather than repeated shifts.
+                $max = [int]$Shared['histMax']
+                foreach ($key in @('t','r','w','i')) {
+                    if ($h[$key].Count -gt $max) { $h[$key].RemoveRange(0, $h[$key].Count - $max) }
+                }
+                foreach ($k in @($h['d'].Keys)) {
+                    foreach ($s in @('busy','r','w')) {
+                        if ($h['d'][$k][$s].Count -gt $max) { $h['d'][$k][$s].RemoveRange(0, $h['d'][$k][$s].Count - $max) }
+                    }
+                }
+                $Shared['histAcc'] = @{ since=$now; n=0; r=0.0; w=0.0; i=0.0; d=@{} }
+            }
         } catch {}
         # Interruptible sleep: check the stop flag every 100ms so shutdown is
         # prompt even for the 5s storage loop.
-        $left = $IntervalMs
-        while ($left -gt 0 -and -not $Shared['stop']) {
-            $chunk = [math]::Min(100, $left); Start-Sleep -Milliseconds $chunk; $left -= $chunk
-        }
+        Wait-Interval $Shared $IntervalMs
     }
 }
 
@@ -252,10 +362,7 @@ $JobsScript = {
         } catch {}
         # Interruptible sleep: check the stop flag every 100ms so shutdown is
         # prompt even for the 5s storage loop.
-        $left = $IntervalMs
-        while ($left -gt 0 -and -not $Shared['stop']) {
-            $chunk = [math]::Min(100, $left); Start-Sleep -Milliseconds $chunk; $left -= $chunk
-        }
+        Wait-Interval $Shared $IntervalMs
     }
 }
 
@@ -361,10 +468,7 @@ $SystemScript = {
             }
             $Shared['systemJson'] = ($vals | ConvertTo-Json -Depth 5 -Compress)
         } catch {}
-        $left = $IntervalMs
-        while ($left -gt 0 -and -not $Shared['stop']) {
-            $chunk = [math]::Min(100, $left); Start-Sleep -Milliseconds $chunk; $left -= $chunk
-        }
+        Wait-Interval $Shared $IntervalMs
     }
 }
 
@@ -383,11 +487,45 @@ $WearScript = {
                 $wt = @{}
                 $all = @(Get-PhysicalDisk -ErrorAction Stop)
                 $done = 0
+
+                # SMART's own "this drive is about to die" flag, which is a
+                # DIFFERENT signal from Storage Spaces' "Predictive Failure"
+                # operational status — the drive's firmware raises this one, and
+                # Storage Spaces does not always surface it. Read once per sweep
+                # for the whole machine rather than per drive.
+                $predict = @{}
+                try {
+                    foreach ($fp in (Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)) {
+                        # InstanceName looks like "SCSI\Disk...&0000_0". Key on the
+                        # leading portion so it can be matched loosely below.
+                        $predict["$($fp.InstanceName)"] = [pscustomobject]@{
+                            failing = [bool]$fp.PredictFailure
+                            reason  = [int]$fp.Reason
+                        }
+                    }
+                } catch {}
+                $anyPredict = @($predict.Values | Where-Object { $_.failing }).Count
+
                 foreach ($pd in $all) {
                     if ($Shared['stop']) { break }
                     try {
                         $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop
-                        $wt["$($pd.UniqueId)"] = [pscustomobject]@{ wear = $rc.Wear; temp = $rc.Temperature }
+                        # TemperatureMax is the DRIVE'S OWN rated maximum. Comparing
+                        # against a fixed number is how you either cry wolf about a
+                        # warm NVMe or stay silent about a cooking spindle — the
+                        # safe operating range is a property of the drive, not a
+                        # constant.
+                        $tmax = $null
+                        try { if ($null -ne $rc.TemperatureMax -and [double]$rc.TemperatureMax -gt 0) { $tmax = [double]$rc.TemperatureMax } } catch {}
+                        $wt["$($pd.UniqueId)"] = [pscustomobject]@{
+                            wear = $rc.Wear; temp = $rc.Temperature; tempMax = $tmax
+                            readErr  = $rc.ReadErrorsTotal
+                            writeErr = $rc.WriteErrorsTotal
+                            powerOnHours = $rc.PowerOnHours
+                            # Any drive on this box flagged by SMART; matched per
+                            # drive below where the instance name allows it.
+                            smartFailing = $null
+                        }
                     } catch {}
                     $done++
                     # Publish AFTER EVERY DRIVE. SMART reads are the slowest calls
@@ -398,12 +536,19 @@ $WearScript = {
                     $Shared['wear'] = @{} + $wt
                     $Shared['wearProgress'] = [pscustomobject]@{ done = $done; total = $all.Count }
                 }
+                # Machine-wide SMART verdict. Reported separately and honestly:
+                # WMI's instance names cannot be reliably joined to Storage Spaces
+                # UniqueIds, so claiming WHICH drive would be a guess. Saying "SMART
+                # is predicting failure somewhere on this box" is true and
+                # actionable; naming the wrong drive would not be.
+                $Shared['smart'] = [pscustomobject]@{
+                    checked = $predict.Count
+                    failing = $anyPredict
+                    at      = (Get-Date).ToString('o')
+                }
             } catch {}
         }
-        $left = $IntervalMs
-        while ($left -gt 0 -and -not $Shared['stop']) {
-            $chunk = [math]::Min(100, $left); Start-Sleep -Milliseconds $chunk; $left -= $chunk
-        }
+        Wait-Interval $Shared $IntervalMs
     }
 }
 
@@ -545,10 +690,7 @@ $LayoutScript = {
             }
             $Shared['layout'] = $lay
         } catch {}
-        $left = $IntervalMs
-        while ($left -gt 0 -and -not $Shared['stop']) {
-            $chunk = [math]::Min(100, $left); Start-Sleep -Milliseconds $chunk; $left -= $chunk
-        }
+        Wait-Interval $Shared $IntervalMs
     }
 }
 
@@ -651,6 +793,10 @@ $StorageScript = {
                     number    = $pnum
                     isSystem  = if ($pmeta) { [bool]$pmeta.IsSystem } else { $false }
                     canPool   = [bool]$pd.CanPool
+                    # Why a drive is NOT poolable: In a pool / Not healthy /
+                    # Offline / Insufficient capacity / Removable media / ...
+                    # "CanPool: False" on its own is a fact you can do nothing with.
+                    cannotPoolReason = (@($pd.CannotPoolReason | ForEach-Object { "$_" } | Where-Object { $_ }) -join ', ')
                     deviceId  = "$($pd.DeviceId)"
                     name      = "$($pd.FriendlyName)"
                     mediaType = "$($pd.MediaType)"
@@ -658,11 +804,57 @@ $StorageScript = {
                     usage     = "$($pd.Usage)"
                     size      = [double]$pd.Size
                     health    = "$($pd.HealthStatus)"
-                    opStatus  = "$($pd.OperationalStatus)"
+                    # OperationalStatus is a COLLECTION ("OK", or "Lost Communication",
+                    # or several at once). Plain "$(...)" joins an array with spaces,
+                    # which is unsplittable because the values themselves contain
+                    # spaces. Join explicitly so the UI can separate them.
+                    opStatus  = (@($pd.OperationalStatus | ForEach-Object { "$_" }) -join ', ')
                     wear      = if ($w) { [double]$w.wear } else { $null }
                     tempC     = if ($w) { [double]$w.temp } else { $null }
+                    # The drive's OWN rated maximum, so "too hot" is measured
+                    # against this drive rather than a number someone picked.
+                    tempMaxC  = if ($w -and $null -ne $w.tempMax) { [double]$w.tempMax } else { $null }
+                    readErr   = if ($w) { $w.readErr }  else { $null }
+                    writeErr  = if ($w) { $w.writeErr } else { $null }
+                    powerOnHours = if ($w) { $w.powerOnHours } else { $null }
+                    # ---- physical identity, for the bay map ----------------
+                    # The last mile of every triage is physical: the dashboard
+                    # can tell you disk 7 is dead and still leave you standing
+                    # in front of 37 identical drives.
+                    #
+                    # serial is the key the bay map is stored against — it is
+                    # printed on the drive itself, survives reboots, re-cabling
+                    # and moving the disk to another port, and is the one thing
+                    # you can read while holding the thing. uniqueId is the
+                    # fallback for drives that report no serial.
+                    serial    = "$($pd.SerialNumber)".Trim()
+                    uniqueId  = "$($pd.UniqueId)"
+                    # Whatever the hardware volunteers. Absent on most direct-
+                    # attach consumer kit, present on real SES enclosures.
+                    slot      = if ($null -ne $pd.SlotNumber) { "$($pd.SlotNumber)" } else { '' }
+                    enclosure = if ($null -ne $pd.EnclosureNumber) { "$($pd.EnclosureNumber)" } else { '' }
+                    physLoc   = "$($pd.PhysicalLocation)"
+                    bay       = ''   # filled in below from bays.json
                 }
             }
+
+            # ---- bay map -------------------------------------------------------
+            # Resolve each drive to a human bay label. Precedence:
+            #   1. what YOU wrote in bays.json, keyed by serial (or uniqueId)
+            #   2. what the ENCLOSURE reports, if the hardware has SES
+            # Your label always wins: if you have relabelled the drawers, the
+            # enclosure's idea of slot 3 is not the sticker you put on it.
+            try {
+                $bays = $Shared['bays']
+                foreach ($p in $physList) {
+                    $key = if ($p.serial) { $p.serial } else { $p.uniqueId }
+                    $lbl = ''
+                    if ($bays -and $key -and $bays.ContainsKey($key)) { $lbl = "$($bays[$key])" }
+                    elseif ($p.enclosure -ne '' -and $p.slot -ne '') { $lbl = "encl $($p.enclosure) slot $($p.slot)" }
+                    elseif ($p.slot -ne '')                          { $lbl = "slot $($p.slot)" }
+                    $p.bay = $lbl
+                }
+            } catch {}
 
             # --- pools ---
             $pools = @(); $poolRaw = 0; $poolErr = ''; $poolVia = ''
@@ -710,7 +902,15 @@ $StorageScript = {
                     $freeB = $size - $alloc
                     if ($freeB -lt 0) { $freeB = [double]0 }
                     [pscustomobject]@{
-                        name = "$($pool.FriendlyName)"; health = $hs; opStatus = "$($pool.OperationalStatus)"
+                        name = "$($pool.FriendlyName)"; health = $hs
+                        opStatus = (@($pool.OperationalStatus | ForEach-Object { "$_" }) -join ', ')
+                        # WHY it is read-only, which changes everything. "Incomplete"
+                        # means the pool lost quorum — most drives are gone — and is a
+                        # catastrophe. "Policy" means an administrator set it, and is a
+                        # Tuesday. Rendering both as the bare word "Read-only" tells you
+                        # the state and hides the emergency.
+                        isReadOnly = [bool]$pool.IsReadOnly
+                        readOnlyReason = "$($pool.ReadOnlyReason)"
                         size = $size; allocated = $alloc; free = $freeB
                         pctUsed = if ($size -gt 0) { [math]::Round($alloc/$size*100,1) } else { 0 }
                         diskNumbers = @($pdNums)
@@ -782,7 +982,11 @@ $StorageScript = {
                         } | Sort-Object { switch -Regex ($_.mediaType) { 'SSD' {0} 'SCM' {-1} 'HDD' {2} default {1} } })
                     } catch {}
                     [pscustomobject]@{
-                        name = "$($vd.FriendlyName)"; health = "$($vd.HealthStatus)"; opStatus = "$($vd.OperationalStatus)"
+                        name = "$($vd.FriendlyName)"; health = "$($vd.HealthStatus)"
+                        opStatus = (@($vd.OperationalStatus | ForEach-Object { "$_" }) -join ', ')
+                        # "Detached" alone is ambiguous: By Policy is deliberate,
+                        # Majority Disks Unhealthy means the data may be gone.
+                        detachedReason = "$($vd.DetachedReason)"
                         size = [double]$vd.Size; footprint = [double]$vd.FootprintOnPool; allocated = [double]$vd.AllocatedSize
                         writeCacheSize = [double]$vd.WriteCacheSize; resiliency = "$($vd.ResiliencySettingName)"
                         provisioning = "$($vd.ProvisioningType)"; tiered = ($vdTiers.Count -gt 1); tiers = @($vdTiers)
@@ -843,6 +1047,196 @@ $StorageScript = {
                     poolErr  = "$poolErr"      # every failure, including mapping
                 }
             }
+            # ---- event timeline: diff this pass against the last -------------
+            # Deliberately diffs the FLAT state (health + operational status per
+            # named object) rather than the whole payload, so a byte that moved
+            # in a capacity figure does not read as an event. Only transitions
+            # a human would call something happening.
+            try {
+                $curr = @{}
+                foreach ($p in $physList) { $curr["drive|$($p.name)"] = "$($p.health) / $($p.opStatus) / $($p.usage)" }
+                foreach ($p in $pools)    { $curr["pool|$($p.name)"]  = "$($p.health) / $($p.opStatus)" }
+                foreach ($v in $vdisks)   { $curr["space|$($v.name)"] = "$($v.health) / $($v.opStatus)" }
+
+                $prev = $Shared['evPrev']
+                if ($prev) {
+                    $new = @()
+                    foreach ($k in $curr.Keys) {
+                        $was = $prev[$k]
+                        if ($null -eq $was) {
+                            $new += [pscustomobject]@{ t=(Get-Date).ToString('o'); kind=($k -split '\|')[0]
+                                                       name=($k -split '\|',2)[1]; from=''; to=$curr[$k]; verb='appeared' }
+                        } elseif ($was -ne $curr[$k]) {
+                            $new += [pscustomobject]@{ t=(Get-Date).ToString('o'); kind=($k -split '\|')[0]
+                                                       name=($k -split '\|',2)[1]; from=$was; to=$curr[$k]; verb='changed' }
+                        }
+                    }
+                    foreach ($k in $prev.Keys) {
+                        if (-not $curr.ContainsKey($k)) {
+                            $new += [pscustomobject]@{ t=(Get-Date).ToString('o'); kind=($k -split '\|')[0]
+                                                       name=($k -split '\|',2)[1]; from=$prev[$k]; to=''; verb='disappeared' }
+                        }
+                    }
+                    if ($new.Count) {
+                        # Bounded ring: 300 entries is hours of a normal system and
+                        # minutes of a thrashing one, which is the case that matters.
+                        $all = @($Shared['events']) + $new
+                        if ($all.Count -gt 300) { $all = $all[($all.Count-300)..($all.Count-1)] }
+                        $Shared['events'] = @($all)
+
+                        # Mirror to the Windows event log. NOT an alerting engine —
+                        # the opposite. Whatever you already run (a scheduled task,
+                        # a monitoring agent, Event Viewer at 2am) picks these up
+                        # for free, and this script never has to own notification,
+                        # retention, or an SMTP config.
+                        if ($Shared['evtLog']) {
+                            foreach ($n in $new) {
+                                try {
+                                    $isBad = ($n.verb -eq 'disappeared') -or
+                                             ($n.to -match 'Unhealthy|Lost Communication|Detached|Not Responding|IO Error|Split')
+                                    $isWarn= ($n.to -match 'Warning|Degraded|Incomplete|Predictive|Stale|Unrecognized|Retired')
+                                    $type  = if ($isBad) { 'Error' } elseif ($isWarn) { 'Warning' } else { 'Information' }
+                                    # Skip the routine: only transitions worth waking for.
+                                    if ($type -eq 'Information' -and $n.verb -ne 'disappeared') { continue }
+                                    Write-EventLog -LogName Application -Source 'StorageSpacesDashboard' `
+                                        -EventId $(if ($isBad) { 9001 } elseif ($isWarn) { 9002 } else { 9003 }) `
+                                        -EntryType $type `
+                                        -Message ("{0} '{1}' {2}: {3} -> {4}" -f $n.kind, $n.name, $n.verb, $n.from, $n.to) `
+                                        -ErrorAction Stop
+                                } catch {}
+                            }
+                        }
+                    }
+                }
+                $Shared['evPrev'] = $curr
+            } catch {}
+
+            # ---- identify LED auto-off -----------------------------------------
+            # Nobody should have to remember to turn a light off, and a blinking
+            # drive that was fine is exactly the kind of false signal this
+            # dashboard exists to avoid. Deadline lives in shared state; this
+            # collector is already running, so it does the switching off.
+            try {
+                $idf = $Shared['identify']
+                if ($idf -and [datetime]::UtcNow -ge $idf.until) {
+                    $target = Get-PhysicalDisk -UniqueId $idf.uniqueId -ErrorAction SilentlyContinue
+                    if ($target) {
+                        try   { Disable-PhysicalDiskIndication    -InputObject $target -ErrorAction Stop }
+                        catch { try { Disable-PhysicalDiskIdentification -InputObject $target -ErrorAction Stop } catch {} }
+                    }
+                    $Shared['identify'] = $null
+                }
+            } catch { $Shared['identify'] = $null }
+
+            # ---- ReFS data integrity ------------------------------------------
+            # A whole class of failure this dashboard was blind to: silent
+            # corruption. ReFS only checksums FILE DATA when integrity streams
+            # are enabled, which is OFF BY DEFAULT — so a volume can be
+            # "Healthy" while quietly rotting, and Storage Spaces' resiliency
+            # cannot repair what nothing detected.
+            #
+            # Three things worth knowing, none of which any other panel shows:
+            #   1. is there a ReFS volume at all
+            #   2. when did the Data Integrity Scan last run, and did it succeed
+            #      (scheduled task, default cadence is every four weeks)
+            #   3. has ReFS logged any corruption — it writes them to the System
+            #      log, including whether it managed to fix them
+            #
+            # Recomputed at most every 5 minutes: Get-ScheduledTask and
+            # Get-WinEvent are far too slow for the 5s topology cadence.
+            try {
+                $lastInt = $Shared['integrityAt']
+                if (-not $lastInt -or ([datetime]::UtcNow - $lastInt).TotalSeconds -ge 300) {
+                    $refsVols = @()
+                    try {
+                        $refsVols = @(Get-Volume -ErrorAction Stop |
+                            Where-Object { "$($_.FileSystem)" -match 'ReFS' } |
+                            ForEach-Object {
+                                [pscustomobject]@{
+                                    drive  = if ($_.DriveLetter) { "$($_.DriveLetter):" } else { "$($_.FileSystemLabel)" }
+                                    label  = "$($_.FileSystemLabel)"
+                                    health = "$($_.HealthStatus)"
+                                }
+                            })
+                    } catch {}
+
+                    $scan = $null
+                    try {
+                        $t = Get-ScheduledTask -TaskPath '\Microsoft\Windows\Data Integrity Scan\' -ErrorAction Stop |
+                             Select-Object -First 1
+                        if ($t) {
+                            $i = $t | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+                            $scan = [pscustomobject]@{
+                                name    = "$($t.TaskName)"
+                                state   = "$($t.State)"
+                                # Task Scheduler returns a SENTINEL date for "never
+                                # run" — 1899-12-30 or 1999-11-30 depending on the
+                                # API path. A `.Year -gt 1900` guard let the 1999
+                                # one through and the UI cheerfully reported "last
+                                # ran 9732 days ago". Anything before 2000 is not a
+                                # date, it is the absence of one.
+                                lastRun = if ($i -and $i.LastRunTime -and $i.LastRunTime.Year -ge 2000) { $i.LastRunTime.ToString('o') } else { $null }
+                                nextRun = if ($i -and $i.NextRunTime -and $i.NextRunTime.Year -ge 2000) { $i.NextRunTime.ToString('o') } else { $null }
+                                # 0 is success; 267011 means "has never run".
+                                lastResult = if ($i) { [int]$i.LastTaskResult } else { $null }
+                            }
+                        }
+                    } catch {}
+
+                    # ReFS corruption events from the System log. Bounded lookback
+                    # and count so a machine with a screaming log cannot stall the
+                    # collector.
+                    $corrupt = @()
+                    try {
+                        $corrupt = @(Get-WinEvent -FilterHashtable @{
+                                        LogName='System'
+                                        ProviderName='Microsoft-Windows-ReFS','Microsoft-Windows-DataIntegrityScan'
+                                        StartTime=(Get-Date).AddDays(-30)
+                                     } -MaxEvents 25 -ErrorAction Stop |
+                            ForEach-Object {
+                                [pscustomobject]@{
+                                    t     = $_.TimeCreated.ToString('o')
+                                    id    = [int]$_.Id
+                                    level = "$($_.LevelDisplayName)"
+                                    src   = "$($_.ProviderName)"
+                                    msg   = ("$($_.Message)" -split "`r?`n")[0]
+                                }
+                            })
+                    } catch {}
+
+                    $Shared['integrity'] = [pscustomobject]@{
+                        refsVolumes = @($refsVols)
+                        scan        = $scan
+                        events      = @($corrupt)
+                        checkedAt   = (Get-Date).ToString('o')
+                    }
+                    $Shared['integrityAt'] = [datetime]::UtcNow
+                }
+            } catch {}
+
+            # ---- capacity trend, for the forecast --------------------------
+            # One sample a minute. A pool fills over days or months, so a denser
+            # series buys nothing and just makes the payload bigger.
+            try {
+                $ch = $Shared['capHist']
+                $nowS = [math]::Round(([datetime]::UtcNow - [datetime]'1970-01-01').TotalSeconds)
+                foreach ($p in $pools) {
+                    if (-not $ch.ContainsKey($p.name)) {
+                        $ch[$p.name] = [System.Collections.Generic.List[object]]::new()
+                    }
+                    $lst = $ch[$p.name]
+                    if ($lst.Count -eq 0 -or ($nowS - [double]$lst[$lst.Count-1].t) -ge 60) {
+                        [void]$lst.Add([pscustomobject]@{ t=$nowS; alloc=[double]$p.allocated; size=[double]$p.size })
+                        # 3 days at 1/min. Long enough to see a real trend, short
+                        # enough that the payload stays trivial.
+                        if ($lst.Count -gt 4320) { $lst.RemoveRange(0, $lst.Count - 4320) }
+                    }
+                }
+            } catch {}
+
+            $topo | Add-Member -NotePropertyName events -NotePropertyValue @($Shared['events']) -Force
+            $topo | Add-Member -NotePropertyName integrity -NotePropertyValue $Shared['integrity'] -Force
+            $topo | Add-Member -NotePropertyName smart -NotePropertyValue $Shared['smart'] -Force
             $Shared['topoJson'] = ($topo | ConvertTo-Json -Depth 6 -Compress)
             $lastPassMs = [int]$swPass.ElapsedMilliseconds
         } catch {}
@@ -857,11 +1251,10 @@ $StorageScript = {
                 $Shared['log'].Enqueue("topology: a scan takes ${lastPassMs}ms, longer than the ${IntervalMs}ms interval — backing off to ${sleepMs}ms between scans")
             }
         }
-        # Interruptible sleep: check the stop flag every 100ms so shutdown stays prompt.
-        $left = $sleepMs
-        while ($left -gt 0 -and -not $Shared['stop']) {
-            $chunk = [math]::Min(100, $left); Start-Sleep -Milliseconds $chunk; $left -= $chunk
-        }
+        # This one sleeps for a SELF-LIMITED interval, not the configured one —
+        # the topology collector backs off to its own scan duration when a pass
+        # runs long. Same helper, different argument.
+        Wait-Interval $Shared $sleepMs
     }
 }
 
@@ -876,10 +1269,68 @@ $HtmlPage = @'
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__HOST__ · Storage Spaces</title>
 <style>
+  /* ---- tokens -------------------------------------------------------------
+     One place for every colour. Dark is the default and stays byte-identical to
+     what shipped; light is a real theme, not an inversion — the status hues are
+     re-picked for contrast on a pale ground rather than reused, because #3fb950
+     on white is unreadable and #d29922 is worse.
+
+     Resolution order:  [data-theme] on <html>  >  OS preference  >  dark.
+     Canvas cannot resolve var(), so chart code reads these through cssVar() and
+     caches them per theme — see TC / refreshThemeColors(). */
   :root{
     --bg:#0e1116; --panel:#171b22; --panel2:#1f2530; --border:#2a3140;
     --text:#e6edf3; --muted:#8b98a9; --accent:#4aa3ff; --good:#3fb950;
     --warn:#d29922; --bad:#f85149; --read:#4aa3ff; --write:#bc8cff;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+    --fill-a:.16;            /* chart area-fill alpha, per theme */
+    --hi:#12324a; --hi-br:#1d4d70; --hi-fg:#7cc4ff;
+    --alert-fg:#ff9b95; --alert-bg:#3a1518;
+    --warnstate-fg:#e8bd6d; --warnstate-bg:#38290f;
+    /* Halo behind text that sits ON TOP of a coloured bar, so it stays legible
+       whatever colour the fill is. It must match the BACKGROUND, not the text —
+       a black glow behind near-black text on the light theme reads as blur, not
+       contrast. That is what made the bar labels look smudged. */
+    --halo:0 0 3px rgba(0,0,0,.75), 0 0 6px rgba(0,0,0,.45);
+    --stackdiv:rgba(0,0,0,.35);
+    --backdrop:rgba(0,0,0,.66);
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef1f5; --border:#d6dce4;
+      --text:#131a22; --muted:#5a6675; --accent:#0a63c9; --good:#1a7f37;
+      --warn:#8a5c00; --bad:#cf222e; --read:#0a63c9; --write:#7b3fd4;
+      --shadow:0 1px 2px rgba(16,24,40,.08);
+      --fill-a:.13;
+      --hi:#dbeafe; --hi-br:#9dc4f5; --hi-fg:#0a4fa3;
+      --alert-fg:#a4161a; --alert-bg:#fbe3e4;
+      --warnstate-fg:#7a4b00; --warnstate-bg:#fdf0d5;
+      --halo:0 0 3px rgba(255,255,255,.95), 0 0 7px rgba(255,255,255,.8);
+      --stackdiv:rgba(255,255,255,.55);
+      --backdrop:rgba(30,38,48,.55);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef1f5; --border:#d6dce4;
+    --text:#131a22; --muted:#5a6675; --accent:#0a63c9; --good:#1a7f37;
+    --warn:#8a5c00; --bad:#cf222e; --read:#0a63c9; --write:#7b3fd4;
+    --shadow:0 1px 2px rgba(16,24,40,.08);
+    --fill-a:.13;
+    --hi:#dbeafe; --hi-br:#9dc4f5; --hi-fg:#0a4fa3;
+    --alert-fg:#a4161a; --alert-bg:#fbe3e4;
+    --warnstate-fg:#7a4b00; --warnstate-bg:#fdf0d5;
+    --halo:0 0 3px rgba(255,255,255,.95), 0 0 7px rgba(255,255,255,.8);
+    --stackdiv:rgba(255,255,255,.55);
+    --backdrop:rgba(30,38,48,.55);
+  }
+  /* Respect the OS. The failed-drive dot pulses forever, which is exactly the
+     kind of thing that is a problem for vestibular disorders — and it is
+     guaranteed to be on screen during the worst moment. Motion goes, the signal
+     does NOT: a heavier ring replaces it. */
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;
+      transition-duration:.001ms!important;scroll-behavior:auto!important}
+    .ndot.bad{box-shadow:0 0 0 3px rgba(248,81,73,.30),0 0 0 5px rgba(248,81,73,.18)}
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);
@@ -888,20 +1339,48 @@ $HtmlPage = @'
     border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:5}
   header h1{font-size:16px;margin:0;font-weight:600}
   /* which server am I looking at — deliberately high contrast */
-  .hostchip{font-size:13px;font-weight:700;letter-spacing:.4px;color:#7cc4ff;
-    background:#12324a;border:1px solid #1d4d70;border-radius:6px;padding:3px 10px;
+  .hostchip{font-size:13px;font-weight:700;letter-spacing:.4px;color:var(--hi-fg);
+    background:var(--hi);border:1px solid var(--hi-br);border-radius:6px;padding:3px 10px;
     white-space:nowrap;text-transform:uppercase}
+  /* Theme toggle. Fixed width so switching the glyph cannot reflow the header. */
+  .themebtn{margin-left:auto;background:var(--panel2);border:1px solid var(--border);
+    color:var(--muted);border-radius:6px;width:30px;height:26px;cursor:pointer;
+    font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;flex:none}
+  .themebtn:hover{color:var(--text);border-color:var(--muted)}
   .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px}
   .status{color:var(--muted);font-size:12px}
   /* shell: fixed left nav + scrolling content */
   .shell{display:flex;align-items:flex-start}
   .side{width:186px;flex:none;background:var(--panel);border-right:1px solid var(--border);
     padding:12px 9px;position:sticky;top:52px;height:calc(100vh - 52px);overflow:auto}
+  /* .navitem is a real <button> so it is reachable by keyboard. The reset keeps
+     it looking identical; without `font:inherit` a button drops to the UA font. */
   .navitem{padding:9px 11px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--muted);
-    display:flex;align-items:center;gap:9px;margin-bottom:2px;user-select:none;white-space:nowrap}
+    display:flex;align-items:center;gap:9px;margin-bottom:2px;user-select:none;white-space:nowrap;
+    width:100%;text-align:left;background:none;border:0;font-family:inherit;line-height:1.4}
   .navitem:hover{background:var(--panel2);color:var(--text)}
-  .navitem.active{background:#17314a;color:#7cc4ff;font-weight:600}
+  /* ---- focus -------------------------------------------------------------
+     There were previously ZERO focusable elements and zero focus styles: every
+     control was a <div> with a click handler, so the dashboard could not be
+     operated by keyboard at all. That is not a compliance checkbox - it is
+     being unable to move around the UI at 2am over laggy RDP. */
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+  .navitem:focus-visible{outline-offset:-2px}
+  /* Never remove the outline without replacing it. */
+  :focus:not(:focus-visible){outline:none}
+  .skiplink{position:absolute;left:-9999px;top:0;z-index:50;background:var(--accent);color:#04121f;
+    padding:9px 14px;border-radius:0 0 8px 0;font-weight:600;font-size:13px}
+  .skiplink:focus{left:0}
+  /* Rows that filter the dashboard when clicked are keyboard-activatable too. */
+  tr[data-ft]{cursor:pointer}
+  tr[data-ft]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .navitem.active{background:var(--hi);color:var(--hi-fg);font-weight:600}
   .navitem .nb{margin-left:auto;font-size:10px;color:var(--muted);font-weight:400}
+  /* Inline SVG at currentColor: the icon inherits the item's state colour, so an
+     alerting section's glyph turns red with its label. Emoji could never do this. */
+  .nicon{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;
+    opacity:.85;overflow:visible}
+  .navitem.active .nicon,.navitem:hover .nicon{opacity:1}
   /* at-a-glance health, visible from every tab */
   .ndot{width:8px;height:8px;border-radius:50%;flex:none;display:none}
   .ndot.ok{display:inline-block;background:var(--good);box-shadow:0 0 0 3px rgba(63,185,80,.16)}
@@ -909,9 +1388,16 @@ $HtmlPage = @'
   .ndot.bad{display:inline-block;background:var(--bad);box-shadow:0 0 0 3px rgba(248,81,73,.22);
     animation:pulse 1.8s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-  .navitem.alert{color:#ff9b95}
-  .navitem.alert.active{color:#ff9b95;background:#3a1518}
-  .navitem.warnstate{color:#e8bd6d}
+  /* Tokenized. These were #ff9b95 / #3a1518 / #e8bd6d — pale pink, near-black
+     maroon and pale gold, all picked for a dark ground. On the light theme the
+     alerting nav item rendered as a dark maroon block in an otherwise white
+     rail, and the warn/alert labels sat at roughly 2:1 contrast on white. The
+     ALERTING items are the ones that must stay readable, so they cannot be the
+     ones left behind by a theme. */
+  .navitem.alert{color:var(--alert-fg)}
+  .navitem.alert.active{color:var(--alert-fg);background:var(--alert-bg)}
+  .navitem.warnstate{color:var(--warnstate-fg)}
+  .navitem.warnstate.active{color:var(--warnstate-fg);background:var(--warnstate-bg)}
   .navitem.active .nb{color:#7cc4ff}
   .navsec{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
     padding:12px 11px 5px}
@@ -938,7 +1424,15 @@ $HtmlPage = @'
   /* The VALUE row must not wrap either — a two-line value squeezes the
      bottom-pinned sparkline out of the fixed-height tile. */
   .kpi>div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .kpi .v{font-size:26px;font-weight:700}
+  /* Found by lab/jitter-check.js, and it was here before that file existed.
+     tabular-nums makes every DIGIT the same width; it does nothing about the
+     digit COUNT. So a CPU value going 9 -> 38 -> 100 grew this span from 15px
+     to 30px and shoved the "%" beside it sideways, ten times a second. The
+     sparkline labels were given a fixed width for exactly this reason (see the
+     note above) — the KPI values were missed.
+     min-width is a mitigation, not a proof: a value wider than the reserve
+     still pushes. 4.5ch covers 0-100%, 0.0-9999 MB/s and the IOPS range. */
+  .kpi .v{font-size:26px;font-weight:700;display:inline-block;min-width:4.5ch}
   .kpi .u{font-size:12px;color:var(--muted);margin-left:4px}
   .kpi .sub{font-size:11px;color:var(--muted);margin-top:2px;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:15px}
@@ -951,14 +1445,90 @@ $HtmlPage = @'
   .bar{position:relative;height:16px;background:var(--panel2);border-radius:4px;overflow:hidden;min-width:80px}
   .bar>span{position:absolute;inset:0 auto 0 0;border-radius:4px}
   .bar em{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-    font-style:normal;font-size:11px;color:var(--text);text-shadow:0 0 3px rgba(0,0,0,.7)}
+    font-style:normal;font-size:11px;color:var(--text);text-shadow:var(--halo)}
   .tag{font-size:11px;padding:1px 7px;border-radius:10px;background:var(--panel2);color:var(--muted)}
   .tag.ssd{background:#12324a;color:#7cc4ff}
   .tag.hdd{background:#2a2233;color:#c9a7ff}
   .tag.scm{background:#0f3a2e;color:#6fd7b0}
   .tag.space{background:#3a2a12;color:#f0c07a}
+  /* OperationalStatus chip. Only rendered when the status is NOT plain OK, so
+     its mere presence is the signal — a badge that is always there is a badge
+     nobody reads at 2am. */
+  .optag{display:inline-block;font-size:11px;padding:0 6px;border-radius:9px;
+         margin-left:6px;border:1px solid currentColor;white-space:nowrap;line-height:16px}
+  .unkval{color:var(--muted);font-style:italic}
+  /* Stale-data badge. Sits opposite the panel controls, only exists when the
+     feed behind that panel is genuinely late. Deliberately loud: a panel
+     quietly showing old numbers is worse than one showing none. */
+  /* Physical bay. Deliberately the loudest non-alarm thing on a triage row —
+     it is the only field that tells you what to DO with your hands. */
+  .baytag{display:inline-block;font-size:11px;padding:0 7px;border-radius:9px;
+    background:var(--hi);color:var(--hi-fg);border:1px solid var(--hi-br);
+    white-space:nowrap;line-height:16px;font-weight:600}
+  #bayTbl input{width:100%;background:var(--panel2);border:1px solid var(--border);
+    color:var(--text);border-radius:5px;padding:4px 7px;font-family:inherit;font-size:12px}
+  #bayTbl input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  #bayTbl input:disabled{opacity:.5;cursor:not-allowed}
+  .agetag{position:absolute;top:7px;left:12px;font-size:10px;line-height:16px;
+    padding:0 7px;border-radius:9px;z-index:4;white-space:nowrap;
+    background:var(--warn);color:#1b1300;font-weight:700;letter-spacing:.2px}
+  .card.kpi>.agetag{top:5px;left:8px;font-size:9px}
+  /* A drive the storage stack still lists but Windows has stopped collecting
+     I/O for. It used to just disappear from this table. Struck through, not
+     hidden — the row must remain, and must not look like a working drive. */
+  #diskTbl tbody tr.absent{background:color-mix(in srgb,var(--bad) 7%,transparent)}
+  #diskTbl tbody tr.absent .e-name{text-decoration:line-through;text-decoration-color:var(--bad)}
+  /* triage rows: fixed row height so a changing list cannot reflow the page */
+  .trow{display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:6px;
+    background:var(--panel2);border-radius:0 8px 8px 0;min-height:38px;flex-wrap:wrap}
+  .trow .tkind{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+    min-width:46px;flex:none}
+  .trow .twhy{font-size:13px;font-weight:600}
+  .trow .muted{font-size:12px;margin-left:auto}
+  /* A suppressed finding stays legible — dimmed, never deleted. */
+  .trow.rmuted{opacity:.62}
+  .mutetag{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);
+    border:1px dashed var(--border);border-radius:8px;padding:0 6px;line-height:15px}
+  .rowacts{display:flex;gap:5px;margin-left:8px}
+  .ract{font-size:10px;padding:1px 7px;border-radius:8px;cursor:pointer;font-family:inherit;
+    background:none;color:var(--muted);border:1px solid var(--border);white-space:nowrap}
+  .ract:hover{color:var(--text);border-color:var(--muted)}
+  .trow:not(:hover) .rowacts{opacity:0}
+  .trow:hover .rowacts,.rowacts:focus-within{opacity:1}
+  /* Suppression is NEVER invisible. This bar is present whenever anything is
+     muted, including when the list is otherwise empty. */
+  .supbar{display:flex;align-items:center;gap:10px;margin-top:10px;padding:7px 12px;
+    border:1px dashed var(--border);border-radius:8px;font-size:12px;color:var(--muted)}
+  .supbar button{font-size:11px;padding:1px 9px;border-radius:8px;cursor:pointer;font-family:inherit;
+    background:none;color:var(--accent);border:1px solid var(--border)}
+  /* The remedy. Wraps to its own line so a long command cannot squeeze the
+     finding itself, and it is COPYABLE, never runnable — this dashboard reads
+     the storage stack, it does not repair it. */
+  .fixrow{flex-basis:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)}
+  .fixnote{font-size:12px;color:var(--muted)}
+  .fixcmd{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:var(--bg);
+    border:1px solid var(--border);border-radius:5px;padding:2px 7px;color:var(--text);
+    white-space:pre;overflow-x:auto;max-width:100%}
+  a.ract{text-decoration:none;line-height:15px}
+  .ract.bad{color:var(--bad);border-color:var(--bad)}
+  .blinkbtn{font-size:10px;margin-left:8px;padding:1px 8px;border-radius:8px;cursor:pointer;
+    font-family:inherit;background:none;color:var(--accent);border:1px solid var(--border)}
+  .blinkbtn.on{background:var(--accent);color:#04121f;border-color:var(--accent)}
+  .blinkbtn.bad{color:var(--bad);border-color:var(--bad)}
+  .blinkbtn:disabled{cursor:default}
   /* resizable + scrollable panel bodies (drag the bottom-right corner) */
-  .pbody{overflow:auto;resize:vertical;min-height:70px;position:relative}
+  /* No native `resize`: its grip lives in the bottom-right corner, under the
+     full-bleed canvas and clipped by overflow:hidden, so it was invisible. A
+     custom .reszgrip (added in initPanels) replaces it — a normal-flow bar
+     BELOW the body, so it never overlaps chart or table content. */
+  .pbody{overflow:auto;min-height:70px;position:relative}
+  .reszgrip{height:13px;cursor:ns-resize;display:flex;align-items:center;justify-content:center;
+    touch-action:none;user-select:none;margin-top:2px}
+  .reszgrip::before{content:'';width:38px;height:3px;border-radius:3px;background:var(--border);
+    transition:background .12s,width .12s}
+  .reszgrip:hover::before{background:var(--muted);width:54px}
+  .reszgrip:active::before{background:var(--accent)}
   .pbody::-webkit-scrollbar{width:10px;height:10px}
   .pbody::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
   .pbody::-webkit-scrollbar-thumb:hover{background:#3b4557}
@@ -996,7 +1566,7 @@ $HtmlPage = @'
   .ftol.ok{background:#12331c;color:#5fd47e}
   .ftol.none{background:#3a1518;color:#ff8b84}
   /* zoom popup */
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,.66);z-index:60;
+  .modal{position:fixed;inset:0;background:var(--backdrop);z-index:60;
     display:flex;align-items:center;justify-content:center;padding:26px}
   .modalbox{background:var(--panel);border:1px solid var(--border);border-radius:12px;
     width:min(1150px,95vw);padding:15px 18px 13px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
@@ -1006,7 +1576,7 @@ $HtmlPage = @'
     background:var(--bg);border-radius:8px;padding:4px}
   #modalCanvas{width:100%;height:100%;display:block}
   #modalStats{margin-top:10px;font-size:12px}
-  canvas.mini,#spark{cursor:zoom-in}
+  canvas.mini,#spark,#histChart{cursor:zoom-in}
   .mini{width:100%;height:22px;display:block}
   .cellspark{display:flex;align-items:center;gap:8px}
   .cellspark canvas{flex:1;min-width:60px;background:var(--panel2);border-radius:3px}
@@ -1014,29 +1584,43 @@ $HtmlPage = @'
      next to it and make the graph itself visibly resize every update. */
   .cellspark span{width:56px;flex:none;text-align:right;font-size:12px;white-space:nowrap;overflow:hidden}
   .stack{display:flex;height:22px;border-radius:5px;overflow:hidden;background:var(--panel2)}
-  .stack>span{display:block;height:100%;border-right:1px solid rgba(0,0,0,.35)}
+  .stack>span{display:block;height:100%;border-right:1px solid var(--stackdiv)}
   .stack>span:last-child{border-right:none}
   .mono{font-variant-numeric:tabular-nums}
   .muted{color:var(--muted)}
   .sec{margin-bottom:16px}
-  #spark{width:100%;height:100%;display:block}
+  #spark,#histChart{width:100%;height:100%;display:block}
   .kspark{width:100%;height:28px;display:block;margin-top:8px}
   .two{grid-template-columns:1fr 1fr}
   @media(max-width:900px){.two{grid-template-columns:1fr}}
   .jobsempty{color:var(--muted);font-size:13px}
   /* per-panel close. Absolutely positioned so it never becomes a grid cell. */
   [data-panel]{position:relative}
-  .pclose{position:absolute;top:7px;right:9px;width:21px;height:21px;line-height:20px;
+  /* These are <button> so they are reachable by keyboard. A button brings UA
+     styling with it — an outset border, buttonface background, its own font,
+     and 1px 6px of padding which (with the global border-box) squeezed the
+     glyph into a 9px content box. Reset it all, or the hover states render as
+     a red circle inside a grey 3D ring. */
+  .pclose,.pdrag{appearance:none;-webkit-appearance:none;background:none;border:0;padding:0;
+    margin:0;font-family:inherit;font-weight:400;display:flex;align-items:center;
+    justify-content:center}
+  .pclose{position:absolute;top:7px;right:9px;width:21px;height:21px;line-height:1;
     text-align:center;border-radius:50%;color:var(--muted);cursor:pointer;font-size:12px;
-    opacity:0;transition:opacity .12s,background .12s;z-index:4;user-select:none}
+    opacity:0;transition:opacity .12s,background .12s,color .12s;z-index:4;user-select:none}
   [data-panel]:hover>.pclose{opacity:.75}
-  .pclose:hover{background:var(--bad);color:#fff;opacity:1!important}
-  .pdrag{position:absolute;top:7px;right:34px;width:21px;height:21px;line-height:20px;
+  .pclose:hover,.pclose:focus{background:var(--bad);color:#fff;opacity:1!important}
+  .pdrag{position:absolute;top:7px;right:34px;width:21px;height:21px;line-height:1;
     text-align:center;border-radius:5px;color:var(--muted);cursor:grab;font-size:13px;
-    opacity:0;transition:opacity .12s;z-index:4;user-select:none}
+    opacity:0;transition:opacity .12s,background .12s;z-index:4;user-select:none}
   [data-panel]:hover>.pdrag{opacity:.55}
-  .pdrag:hover{opacity:1!important;background:var(--panel2)}
+  .pdrag:hover,.pdrag:focus{opacity:1!important;background:var(--panel2)}
   .pdrag:active{cursor:grabbing}
+  /* :focus, NOT :focus-visible. A keyboard user cannot hover, so a control that
+     is invisible until hover must appear on ANY focus — :focus-visible only
+     matches keyboard-modality focus, which would leave it invisible in the
+     cases it is reached some other way. The outline ring still uses
+     :focus-visible; only the reveal is broadened. */
+  .pclose:focus,.pdrag:focus{opacity:1!important}
   [data-panel].dragging{opacity:.45}
   [data-panel].dropinto{outline:2px dashed var(--accent);outline-offset:-2px;border-radius:10px}
   /* !important so it beats the inline display the render code sets */
@@ -1071,32 +1655,84 @@ $HtmlPage = @'
     <div id="modalStats" class="status"></div>
   </div>
 </div>
+<a class="skiplink" href="#content">Skip to content</a>
 <header>
-  <h1>💾 Storage Spaces Dashboard</h1>
+  <h1>Storage Spaces Dashboard</h1>
   <span class="hostchip" title="Server this dashboard is reading">__HOST__</span>
   <span id="filterChip" style="display:none"></span>
   <span style="flex:1"></span>
-  <span id="tempUnit" class="status" title="Switch temperature units" style="cursor:pointer;user-select:none;
-    border:1px solid var(--border);border-radius:12px;padding:2px 10px">°C</span>
+  <a id="bundleBtn" class="themebtn" href="/api/bundle" download
+     title="Download everything this dashboard knows as one JSON file"
+     aria-label="Download diagnostic bundle" style="text-decoration:none">⤓</a>
+  <button type="button" id="themeBtn" class="themebtn" title="Switch light / dark theme"
+    aria-label="Switch light or dark theme">◐</button>
+  <button type="button" id="tempUnit" class="status" title="Switch temperature units"
+    aria-label="Switch temperature units" style="cursor:pointer;user-select:none;background:none;
+    color:var(--muted);font-family:inherit;font-size:12px;
+    border:1px solid var(--border);border-radius:12px;padding:2px 10px">°C</button>
   <span id="feeds" class="status mono"></span>
   <span id="clock" class="status mono"></span>
   <span id="conn" class="status"></span>
 </header>
 
 <div class="shell">
-<nav class="side" id="nav">
+<!-- Icons are inline SVG, not emoji. Emoji render as a different picture on
+     every platform, sit on their own baseline, and - the reason that actually
+     matters here - cannot be recoloured, so they can never reflect state.
+     stroke="currentColor" means an alerting section's icon goes red WITH its
+     label, for free. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <g id="i-overview"><rect x="2.5" y="2.5" width="7" height="7" rx="1.5"/><rect x="12.5" y="2.5" width="7" height="5" rx="1.5"/><rect x="12.5" y="10.5" width="7" height="9" rx="1.5"/><rect x="2.5" y="12.5" width="7" height="7" rx="1.5"/></g>
+  <g id="i-drives"><rect x="2.5" y="4.5" width="17" height="6" rx="2"/><rect x="2.5" y="12.5" width="17" height="6" rx="2"/><path d="M6 7.5h.01M6 15.5h.01"/></g>
+  <g id="i-cache"><path d="M12 2.5 5.5 12.5h5l-1 8 7-10.5h-5z" stroke-linejoin="round"/></g>
+  <g id="i-capacity"><path d="M3 6.5 12 2.5l9 4v11l-9 4-9-4z" stroke-linejoin="round"/><path d="M3 6.5 12 10.5l9-4M12 10.5v11"/></g>
+  <g id="i-resiliency"><path d="M12 2.5 4.5 5.5v6c0 4.5 3.1 8.2 7.5 10 4.4-1.8 7.5-5.5 7.5-10v-6z" stroke-linejoin="round"/></g>
+  <g id="i-jobs"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3.3M12 18.2v3.3M2.5 12h3.3M18.2 12h3.3M5.2 5.2l2.4 2.4M16.4 16.4l2.4 2.4M18.8 5.2l-2.4 2.4M7.6 16.4l-2.4 2.4"/></g>
+  <g id="i-restore"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1" stroke-linecap="round"/><path d="M3 3.5v5h5" stroke-linejoin="round"/></g>
+  <g id="i-triage"><path d="M2.5 12.5h4l2.5-6 4 12 2.5-6h6" stroke-linecap="round" stroke-linejoin="round"/></g>
+</defs></svg>
+
+<nav class="side" id="nav" aria-label="Sections">
+  <div class="navsec" id="triageSec" style="display:none">Attention</div>
+  <button type="button" class="navitem" id="navTriage" data-group="triage" style="display:none"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-triage"/></svg>Triage <span class="ndot" id="ndTriage"></span><span class="nb" id="nbTriage"></span></button>
   <div class="navsec">Live</div>
-  <div class="navitem active" data-group="overview">📊 Overview</div>
-  <div class="navitem" data-group="drives">💽 Drives <span class="ndot" id="ndDrives"></span><span class="nb" id="nbDrives"></span></div>
-  <div class="navitem" data-group="cache">⚡ Cache</div>
+  <button type="button" class="navitem active" data-group="overview"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-overview"/></svg>Overview</button>
+  <button type="button" class="navitem" data-group="drives"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-drives"/></svg>Drives <span class="ndot" id="ndDrives"></span><span class="nb" id="nbDrives"></span></button>
+  <button type="button" class="navitem" data-group="cache"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-cache"/></svg>Cache</button>
   <div class="navsec">Configuration</div>
-  <div class="navitem" data-group="capacity">📦 Capacity <span class="ndot" id="ndCap"></span><span class="nb" id="nbCap"></span></div>
-  <div class="navitem" data-group="resiliency">🛡️ Resiliency <span class="ndot" id="ndRes"></span></div>
-  <div class="navitem" data-group="jobs">🔧 Jobs <span class="nb" id="nbJobs"></span></div>
+  <button type="button" class="navitem" data-group="capacity"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-capacity"/></svg>Capacity <span class="ndot" id="ndCap"></span><span class="nb" id="nbCap"></span></button>
+  <button type="button" class="navitem" data-group="resiliency"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-resiliency"/></svg>Resiliency <span class="ndot" id="ndRes"></span></button>
+  <button type="button" class="navitem" data-group="jobs"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-jobs"/></svg>Jobs <span class="nb" id="nbJobs"></span></button>
   <div class="navsec" id="restoreSec" style="display:none">Hidden panels</div>
-  <div class="navitem" id="restorePanels" style="display:none" title="Show every hidden panel again">↩️ Restore all <span class="nb" id="nbHidden"></span></div>
+  <button type="button" class="navitem" id="restorePanels" style="display:none" title="Show every hidden panel again"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-restore"/></svg>Restore all <span class="nb" id="nbHidden"></span></button>
 </nav>
 <main class="wrap" id="content">
+
+<!-- ============================ TRIAGE ====================================
+     The front door that never existed. Every other section is CURATED - you
+     arrange it once and stare at it for a year. That model is right for a
+     boring Tuesday and hostile at 2am, because it greets an emergency with the
+     layout you built when nothing was wrong, and a panel you closed six months
+     ago because it was noisy on a healthy system is not hidden, it is GONE.
+
+     This section is COMPUTED, never curated: no data-panel attributes, so it
+     cannot be closed, reordered, or lost. It answers three questions in a fixed
+     order - is anything wrong, which object, and what is being done about it -
+     and it is empty when the answer is "nothing", which is itself the answer.
+     ======================================================================== -->
+<section data-group="triage">
+  <div class="card" style="border-color:var(--border)">
+    <h2>Triage</h2>
+    <div id="triageBody"><span class="muted">Waiting for the first topology scan…</span></div>
+  </div>
+  <!-- Ordering is causality. The state panels above say what is wrong NOW; this
+       says what happened FIRST, which is usually the actual question. Recorded
+       server-side so it survives the reload you do when something breaks. -->
+  <div class="card" style="border-color:var(--border);margin-top:16px">
+    <h2>What happened</h2>
+    <div id="timelineBody"><span class="muted">No state changes recorded since the dashboard started.</span></div>
+  </div>
+</section>
 
 <section data-group="overview">
   <div class="grid kpis">
@@ -1110,7 +1746,7 @@ $HtmlPage = @'
   </div>
 
   <div class="card sec" data-panel="throughput">
-    <h2>Throughput (last ~2 min) <span class="muted" style="text-transform:none;letter-spacing:0">· drag the bottom edge to resize</span></h2>
+    <h2>Throughput — live, last ~2 min</h2>
     <div class="pbody" data-pk="spark" style="height:110px;overflow:hidden">
       <canvas id="spark"></canvas>
     </div>
@@ -1118,6 +1754,21 @@ $HtmlPage = @'
       <span class="dot" style="background:var(--read)"></span>Read
       <span class="dot" style="background:var(--write);margin-left:12px"></span>Write
     </div>
+  </div>
+
+  <!-- The same throughput, zoomed out to 15 minutes, RECORDED SERVER-SIDE so it
+       is populated the instant you load the page mid-incident. It sits directly
+       under the live 2-min chart, as its companion, rather than as a giant blank
+       box at the top of Overview — on a calm system it is just the flat line the
+       live chart already shows, only longer. Lives on Overview and not under
+       Triage (which hides when nothing is wrong) so you have seen it before the
+       emergency, but framed as context, not the headline. -->
+  <div class="card sec" data-panel="history">
+    <h2>Throughput — recorded, last 15 min <span class="muted" style="text-transform:none;letter-spacing:0">· what led up to now, kept on the server</span></h2>
+    <div class="pbody" data-pk="hist" style="height:150px;overflow:hidden">
+      <canvas id="histChart"></canvas>
+    </div>
+    <div id="histSub" class="status" style="margin-top:6px">loading…</div>
   </div>
 
   <div class="card sec" id="tierActWrap" data-panel="tierAct" style="display:none">
@@ -1153,10 +1804,29 @@ $HtmlPage = @'
     </div>
   </div>
 
+  <!-- The last mile. Everything else tells you WHICH drive; this is the only
+       thing that tells you which drawer to open. It belongs with the Drives, and
+       it must be reachable when NOTHING is wrong — you fill it in on a quiet
+       afternoon, which is the one time the Triage section does not exist. -->
+  <div class="card sec" data-panel="bayMap">
+    <h2>Physical bay map <span class="muted" style="text-transform:none;letter-spacing:0">· which drawer to open</span></h2>
+    <div id="bayHint" class="status" style="margin-bottom:10px"></div>
+    <div style="overflow-x:auto"><table id="bayTbl">
+      <thead><tr><th>Drive</th><th>Media</th><th style="width:34%">Bay / physical location</th>
+        <th>Serial</th><th>Reported by hardware</th></tr></thead>
+      <tbody><tr><td colspan="5" class="muted">Waiting for the first topology scan…</td></tr></tbody>
+    </table></div>
+  </div>
+
 </section>
 
 <section data-group="capacity" hidden>
   <div class="grid kpis" id="poolKpis" data-panel="poolStats"></div>
+
+  <div class="card sec" data-panel="forecast">
+    <h2>Capacity forecast <span class="muted" style="text-transform:none;letter-spacing:0">· days to full</span></h2>
+    <div id="forecastBody"><span class="muted">Needs a few minutes of allocation history before it can say anything.</span></div>
+  </div>
 
   <div class="card sec" id="poolOverviewWrap" data-panel="poolOverview" style="display:none">
     <h2>Storage Pool <span class="muted" style="text-transform:none;letter-spacing:0">· allocation across the pool</span></h2>
@@ -1261,7 +1931,170 @@ const healthColor = h => isBadHealth(h)?'var(--bad)'
 const busyColor = p => p>=90?'var(--bad)':p>=70?'var(--warn)':'var(--good)';
 function bar(pct,color,label){ pct=Math.max(0,Math.min(100,pct));
   return `<div class="bar"><span style="width:${pct}%;background:${color}"></span><em>${label??pct.toFixed(0)+'%'}</em></div>`; }
-function healthDot(h){ return `<span class="dot" style="background:${healthColor(h)}"></span>${h||'–'}`; }
+const esc = s => String(s??'').replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function healthDot(h){ return `<span class="dot" style="background:${healthColor(h)}"></span>${esc(h)||'–'}`; }
+
+// ---- OperationalStatus ------------------------------------------------------
+// A DIFFERENT FIELD from HealthStatus, and the one that actually names the
+// failure. HealthStatus only ever holds Healthy/Warning/Unhealthy/Unknown —
+// "Degraded" and "Incomplete" are OperationalStatus values, so isWarnHealth's
+// /degrad|incomplete/ could never match: it was hunting the one field that
+// cannot contain the word. Meanwhile opStatus HAS been on the wire for physical
+// disks, pools and virtual disks the whole time, and nothing ever read it.
+//
+// Severity is a TABLE, not a regex. A regex is how "Unhealthy" once matched
+// /healthy/ and painted failing drives green (see the gotchas file).
+// Completed against Microsoft's published state tables (learn.microsoft.com,
+// "Storage Spaces and Storage Spaces Direct health and operational states").
+// The hand-written version was missing six, including 'no redundancy' — which
+// means DATA HAS BEEN LOST and is the single worst string Windows can return.
+const OP_SEVERITY = {
+  'ok':'ok', 'online':'ok', 'active':'ok', 'completed':'ok', 'no error':'ok',
+  // deliberate operator actions and transient housekeeping — these must NOT
+  // alarm, or red stops meaning anything
+  'in maintenance mode':'info', 'starting maintenance mode':'info',
+  'stopping maintenance mode':'info', 'removing from pool':'info',
+  'in service':'info', 'servicing':'info', 'initializing':'info',
+  'updating firmware':'info', 'starting':'info',
+  // healthy, but there is an action worth taking (Optimize-StoragePool)
+  'suboptimal':'info',
+  // resiliency is reduced or going; the data is still reachable
+  'degraded':'warn', 'incomplete':'warn', 'predictive failure':'warn',
+  'stale metadata':'warn', 'unrecognized metadata':'warn',
+  'abnormal latency':'warn', 'transient error':'warn', 'io error':'warn',
+  'read-only':'warn', 'readonly':'warn',
+  // it is not answering, or the data is gone
+  'no redundancy':'bad',            // "lost data because too many drives failed"
+  'lost communication':'bad', 'not responding':'bad',
+  'detached':'bad', 'split':'bad', 'failed media':'bad', 'no media':'bad',
+  'not usable':'bad', 'device hardware failure':'bad',
+  'unrecoverable error':'bad', 'failed':'bad'
+};
+// The REASON codes. "Read-only" and "Detached" are states; these say why, and
+// the why is the difference between an administrator's decision and a disaster.
+const REASON_SEVERITY = {
+  'policy':'info', 'by policy':'info', 'none':'ok', 'starting':'info',
+  'incomplete':'bad',                 // pool lost quorum / not enough drives
+  'majority disks unhealthy':'bad',
+  'timeout':'warn'
+};
+function reasonSev(s){
+  const k=String(s||'').trim().toLowerCase();
+  if(!k || k==='none') return null;
+  return REASON_SEVERITY[k] || 'warn';
+}
+const OP_RANK = { ok:0, info:1, unknown:2, warn:3, bad:4 };
+
+// ---- what to DO about it ----------------------------------------------------
+// A diagnosis without an action is half a triage tool. Microsoft publishes an
+// explicit remedy per state, so this is mostly transcription — see
+// learn.microsoft.com "Storage Spaces and Storage Spaces Direct health and
+// operational states".
+//
+// Commands are shown for you to copy, never executed. This dashboard reads the
+// storage stack; it does not repair it, and a button that silently ran
+// Reset-PhysicalDisk would be the worst idea in the whole project.
+const DOC_STATES = 'https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/storage-spaces-states';
+const DOC_REFS   = 'https://learn.microsoft.com/en-us/windows-server/storage/refs/integrity-streams';
+const DOC_TSHOOT = 'https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/troubleshooting-storage-spaces';
+
+// Keyed by the OperationalStatus string. n = the object's name.
+const FIX_BY_STATE = {
+  'suboptimal':            { cmd:n=>`Optimize-StoragePool -FriendlyName '${n}'` },
+  'degraded':              { cmd:n=>`Repair-VirtualDisk -FriendlyName '${n}'` },
+  'incomplete':            { cmd:n=>`Repair-VirtualDisk -FriendlyName '${n}'` },
+  'in maintenance mode':   { cmd:n=>`Disable-StorageMaintenanceMode -PhysicalDisk (Get-PhysicalDisk -FriendlyName '${n}')` },
+  'io error':              { cmd:n=>`Reset-PhysicalDisk -FriendlyName '${n}'   # then: Repair-VirtualDisk` },
+  'transient error':       { cmd:n=>`Reset-PhysicalDisk -FriendlyName '${n}'   # then: Repair-VirtualDisk` },
+  'stale metadata':        { cmd:n=>`Repair-VirtualDisk -FriendlyName <space>  # if it persists: Reset-PhysicalDisk -FriendlyName '${n}'` },
+  'unrecognized metadata': { cmd:n=>`Reset-PhysicalDisk -FriendlyName '${n}'   # wipes it, then adds it back to the pool` },
+  'split':                 { cmd:n=>`Reset-PhysicalDisk -FriendlyName '${n}'   # then: Repair-VirtualDisk` },
+  'predictive failure':    { note:'Replace the drive.' },
+  'failed media':          { note:'Replace the drive.' },
+  'device hardware failure':{ note:'Replace the drive.' },
+  'abnormal latency':      { note:'Replace the drive if it keeps happening — it slows the whole pool.' },
+  'lost communication':    { note:'Reconnect or replace the drive.' },
+  'no redundancy':         { note:'Data is lost. Replace the failed drives and restore from backup.' },
+  'not usable':            { doc:DOC_TSHOOT }
+};
+
+// Keyed by the rule name in the finding's key, for findings that are not a
+// bare OperationalStatus.
+const FIX_BY_RULE = {
+  'scan-stale':  { cmd:()=>`Start-ScheduledTask -TaskPath '\\Microsoft\\Windows\\Data Integrity Scan\\' -TaskName 'Data Integrity Scan'`,
+                   doc:DOC_REFS },
+  'scan-result': { cmd:()=>`Get-ScheduledTaskInfo -TaskPath '\\Microsoft\\Windows\\Data Integrity Scan\\' -TaskName 'Data Integrity Scan'`,
+                   doc:DOC_REFS },
+  'readonly':    { cmd:n=>`Get-StoragePool -FriendlyName '${n}' | Set-StoragePool -IsReadOnly $false`, doc:DOC_STATES },
+  'detached':    { cmd:()=>`Get-VirtualDisk | Where-Object OperationalStatus -eq 'Detached' | Connect-VirtualDisk`, doc:DOC_STATES },
+  'regen':       { cmd:n=>`Repair-VirtualDisk -FriendlyName '${n}'`, doc:DOC_STATES },
+  'latency':     { note:'Compare against its mirror partners; replace it if the gap persists.' },
+  'temp':        { note:'Check airflow and drive seating. This is measured against the drive’s own rated maximum.' },
+  'predict':     { cmd:()=>`Get-CimInstance -Namespace root\\wmi -ClassName MSStorageDriver_FailurePredictStatus | Where-Object PredictFailure`,
+                   note:'Reported by the drive firmware, not by Storage Spaces.' },
+  'counter':     { note:'If the drive is genuinely gone this is expected; if not, check the cable.' },
+  'cannotpool':  { doc:DOC_STATES }
+};
+
+function fixFor(item){
+  const rule = String(item.key||'').split('/').pop();
+  let f = FIX_BY_RULE[rule];
+  if(!f && rule==='opstatus'){
+    // The finding's `why` is the joined OperationalStatus list; take the worst
+    // one we have a remedy for.
+    const states=String(item.why||'').split('·').map(s=>s.trim().toLowerCase());
+    for(const s of states){ if(FIX_BY_STATE[s]){ f=FIX_BY_STATE[s]; break; } }
+  }
+  if(!f && item.what==='integrity') f={ doc:DOC_REFS };
+  if(!f) return null;
+  return {
+    cmd:  f.cmd ? f.cmd(item.name) : null,
+    note: f.note || null,
+    doc:  f.doc || (item.what==='integrity' ? DOC_REFS : DOC_STATES)
+  };
+}
+
+// navigator.clipboard is a SECURE-CONTEXT API — undefined over plain http:// to
+// anything but localhost, which is exactly how this dashboard is reached from
+// another machine. Same trap as crypto.subtle. execCommand is deprecated and
+// works everywhere, so it is the fallback that actually matters here.
+function copyText(s, btn){
+  const done=ok=>{ const t=btn.textContent; btn.textContent=ok?'copied':'select it'; btn.classList.toggle('bad',!ok);
+                   setTimeout(()=>{ btn.textContent=t; btn.classList.remove('bad'); },1500); };
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(s).then(()=>done(true),()=>done(false)); return;
+  }
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=s; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    const ok=document.execCommand('copy');
+    ta.remove(); done(ok);
+  }catch(e){ done(false); }
+}
+// A status string we have never seen ranks ABOVE ok, so an unrecognised state is
+// surfaced rather than silently assumed fine. Uncertainty is a value.
+function opParse(s){
+  const states = String(s||'').split(',').map(t=>t.trim()).filter(Boolean);
+  let sev = 'ok';
+  for(const t of states){
+    const v = OP_SEVERITY[t.toLowerCase()] || 'unknown';
+    if(OP_RANK[v] > OP_RANK[sev]) sev = v;
+  }
+  return { sev, states };
+}
+const opColor = sev => sev==='bad'    ? 'var(--bad)'
+                     : sev==='warn'   ? 'var(--warn)'
+                     : sev==='info'   ? 'var(--accent)'
+                     : sev==='unknown'? 'var(--muted)' : 'var(--good)';
+function opChip(s){
+  const {sev,states} = opParse(s);
+  if(!states.length || sev==='ok') return '';
+  return `<span class="optag" style="color:${opColor(sev)}" title="OperationalStatus">${esc(states.join(' · '))}</span>`;
+}
+// Health AND operational status together — the two halves of "is this thing ok".
+function statusCell(health, op){ return healthDot(health) + opChip(op); }
 function typeTag(t){ const c=/ssd/i.test(t)?'ssd':/hdd/i.test(t)?'hdd':/scm/i.test(t)?'scm':/space/i.test(t)?'space':'';
   return `<span class="tag ${c}">${t||'?'}</span>`; }
 // A "tier" is only real pool media. RAID logical drives, boot devices and the
@@ -1306,14 +2139,137 @@ function avgLast(arr,n){ const m=Math.min(n||SMOOTH,arr.length); if(!m) return 0
 function maxOf(arr){ let m=0; for(const v of arr) if(v>m) m=v; return m; }
 // Canvas strokeStyle cannot resolve "var(--x)" — it needs a real color value.
 const cssVar   = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-const colorFor = p => p>=90?cssVar('--bad'):p>=70?cssVar('--warn'):cssVar('--good');
+
+// ---- theme-aware chart colours ---------------------------------------------
+// The chart layer used to carry 23 hardcoded rgba() literals — area fills like
+// rgba(74,163,255,.13), chosen to glow over a DARK background. On a light theme
+// a 13%-alpha blue over white is functionally invisible and every sparkline
+// fill just disappears. They cannot be var() because canvas needs a literal.
+//
+// So: one table, resolved from the tokens once per theme and cached (cssVar()
+// is a getComputedStyle call — far too expensive to run 23 times per 100ms
+// frame). refreshThemeColors() is the only thing a theme switch has to call.
+let TC = {};
+function withAlpha(c, a){
+  c = (c||'').trim();
+  let m = c.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if(m){
+    let h = m[1];
+    if(h.length===3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+    return `rgba(${parseInt(h.slice(0,2),16)},${parseInt(h.slice(2,4),16)},${parseInt(h.slice(4,6),16)},${a})`;
+  }
+  m = c.match(/^rgba?\(([^)]+)\)$/i);
+  if(m){ const p=m[1].split(/[,\s/]+/).filter(Boolean); return `rgba(${p[0]},${p[1]},${p[2]},${a})`; }
+  return c;   // unknown format: better a solid colour than nothing drawn
+}
+function refreshThemeColors(){
+  const A = parseFloat(cssVar('--fill-a')) || .16;
+  const g = k => cssVar('--'+k);
+  TC = {
+    a:A,
+    good:g('good'), warn:g('warn'), bad:g('bad'), accent:g('accent'),
+    read:g('read'), write:g('write'), muted:g('muted'), text:g('text'),
+    border:g('border'), panel:g('panel'), panel2:g('panel2'),
+    // area fills, per theme
+    readFill:  withAlpha(g('read'),  A*0.8),
+    writeFill: withAlpha(g('write'), A*0.8),
+    readFillHi:  withAlpha(g('read'),  A),
+    writeFillHi: withAlpha(g('write'), A),
+    goodFill:  withAlpha(g('good'), A*1.1),
+    warnFill:  withAlpha(g('warn'), A*1.1),
+    badFill:   withAlpha(g('bad'),  A*1.1),
+    accentFill:withAlpha(g('accent'),A)
+  };
+}
+refreshThemeColors();
+
+// ---- theme ------------------------------------------------------------------
+// [data-theme] on <html> beats the OS preference; no stored value means follow
+// the OS. The toggle cycles auto -> light -> dark so "just follow the system"
+// stays reachable rather than being a state you can only leave.
+function currentThemeMode(){ try{ return localStorage.getItem('ssdash.theme')||'auto'; }catch(e){ return 'auto'; } }
+function applyTheme(mode){
+  const r=document.documentElement;
+  if(mode==='auto') r.removeAttribute('data-theme'); else r.setAttribute('data-theme',mode);
+  try{ localStorage.setItem('ssdash.theme',mode); }catch(e){}
+  const b=$('#themeBtn');
+  if(b){
+    b.textContent = mode==='light' ? '☀' : mode==='dark' ? '☾' : '◐';
+    b.title = 'Theme: '+mode+' (click to change)';
+  }
+  refreshThemeColors();
+  // Canvases hold baked-in colours from the previous theme until redrawn.
+  diskKey=null; tierKey=null; spaceKey=null;
+  if(typeof drawSpark==='function') drawSpark();
+  if(lastTopoData) applyTopoDerived(lastTopoData);
+}
+function initTheme(){
+  applyTheme(currentThemeMode());
+  const b=$('#themeBtn');
+  if(b) b.addEventListener('click',()=>{
+    const order=['auto','light','dark'];
+    applyTheme(order[(order.indexOf(currentThemeMode())+1)%order.length]);
+  });
+  // Follow the OS live while in auto.
+  if(window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)')
+    .addEventListener('change',()=>{ if(currentThemeMode()==='auto') applyTheme('auto'); });
+}
+
+const colorFor = p => p>=90?TC.bad:p>=70?TC.warn:TC.good;
 
 // latest per-disk status from /api/topology, keyed by OS disk number, merged
 // into the realtime disk table so activity + status live in one view.
 let topoDisks={};
+// Last realtime payload, so triage can see counter failures without waiting for
+// the 5s topology feed — a pulled drive shows up here first.
+let lastPerfData=null;
 // feed health — makes a stalled background collector visible instead of just
 // leaving half the dashboard mysteriously blank.
 let lastTopoAt=0, layoutState='pending', wearState='pending', poolState='pools —';
+
+// ---- per-panel data age -----------------------------------------------------
+// The header has always shown feed freshness, but you have to know to look at
+// it — and during triage you are staring at ONE panel, not the header. A panel
+// whose collector stalled kept rendering its last good numbers, silently, and
+// stale data presented confidently is the defect this whole project keeps
+// re-learning (gotchas 9, 15, 16, 17).
+//
+// The badge only appears once a feed is genuinely late — a badge that is always
+// there is one nobody reads. Same rule as the OperationalStatus chip.
+const FEED_AT = { perf:0, topo:0, system:0 };
+// panel -> which collector actually produces its numbers. Anything unlisted is
+// topology, which is the slow feed and therefore the conservative default.
+const PANEL_FEED = {
+  diskTable:'perf', throughput:'perf', tierAct:'perf', spaces:'perf', repair:'perf', jobs:'perf',
+  'kpi-read':'perf', 'kpi-write':'perf', 'kpi-iops':'perf', 'kpi-iosize':'perf',
+  'kpi-mix':'perf', 'kpi-split':'perf',
+  fileCache:'system', writeCache:'system', tierMove:'system', 'kpi-cpu':'system', 'kpi-wbc':'system'
+};
+// A feed is "late" at 4x its own cadence — long enough not to fire on a normal
+// slow pass, short enough to notice inside an incident.
+function feedLimitMs(f){
+  return f==='perf'   ? Math.max(2000, CFG.pollMs*20)
+       : f==='system' ? Math.max(3000, CFG.systemMs*12)
+       :                Math.max(20000, CFG.topologyMs*4);
+}
+function stampPanelAges(){
+  const now=Date.now();
+  document.querySelectorAll('[data-panel]').forEach(el=>{
+    const feed = PANEL_FEED[el.dataset.panel] || 'topo';
+    const at   = FEED_AT[feed] || (feed==='topo'?lastTopoAt:0);
+    let badge  = el.querySelector(':scope > .agetag');
+    const late = at>0 && (now-at) > feedLimitMs(feed);
+    if(!late){ if(badge) badge.remove(); return; }
+    if(!badge){
+      badge=document.createElement('span');
+      badge.className='agetag';
+      el.appendChild(badge);
+    }
+    const secs=Math.round((now-at)/1000);
+    badge.textContent = secs<60 ? (secs+'s old') : (Math.round(secs/60)+'m old');
+    badge.title = `The ${feed} collector last published ${secs}s ago. These numbers are NOT live.`;
+  });
+}
 let topoReady=false;   // false until the storage collector has published real data
 let topoDiag=null;     // {mapMs,passMs,drives} — how slow the storage scan really is
 
@@ -1352,6 +2308,32 @@ function initNav(){
   // here made it call setGroup(undefined), which hid every section.
   document.querySelectorAll('#nav .navitem[data-group]')
     .forEach(n=>n.addEventListener('click',()=>setGroup(n.dataset.group)));
+
+  // Arrow keys move between sections without touching the mouse — the point of
+  // the whole exercise is being able to drive this over laggy RDP at 2am.
+  $('#nav').addEventListener('keydown',e=>{
+    if(!['ArrowDown','ArrowUp','Home','End'].includes(e.key)) return;
+    const items=[...document.querySelectorAll('#nav .navitem')].filter(n=>n.offsetParent!==null);
+    const i=items.indexOf(document.activeElement);
+    if(i<0) return;
+    e.preventDefault();
+    const j = e.key==='Home' ? 0
+            : e.key==='End'  ? items.length-1
+            : e.key==='ArrowDown' ? (i+1)%items.length
+            : (i-1+items.length)%items.length;
+    items[j].focus();
+  });
+
+  // Rows that filter the dashboard are activatable from the keyboard. Delegated,
+  // so rows re-created by a render keep working without re-wiring.
+  document.addEventListener('keydown',e=>{
+    if(e.key!=='Enter' && e.key!==' ') return;
+    const tr=e.target.closest && e.target.closest('tr[data-ft]');
+    if(!tr) return;
+    e.preventDefault();
+    tr.click();
+  });
+
   let g='overview';
   try{ g=localStorage.getItem('ssdash.group')||'overview'; }catch(e){}
   if(!document.querySelector(`main section[data-group="${g}"]`)) g='overview';
@@ -1377,9 +2359,11 @@ function applyClosed(){
 // creation is idempotent and can be re-run after a re-render.
 function addCloseBtn(el){
   if(!el || el.querySelector(':scope > .pclose')) return;
-  const b=document.createElement('span');
+  const b=document.createElement('button');       // was a <span>: unreachable by keyboard
+  b.type='button';
   b.className='pclose'; b.textContent='✕';
   b.title='Hide this panel';
+  b.setAttribute('aria-label','Hide the '+(el.dataset.panel||'')+' panel');
   b.addEventListener('click',e=>{
     e.stopPropagation();              // panels can sit inside click-to-filter targets
     closedPanels.add(el.dataset.panel); persistClosed(); applyClosed();
@@ -1420,8 +2404,21 @@ function initPanelOrder(){
 function addDragHandle(el){
     if(!el) return;
     if(!el.querySelector(':scope > .pdrag')){
-      const h=document.createElement('span');
+      const h=document.createElement('button');    // was a <span>
+      h.type='button';
       h.className='pdrag'; h.textContent='⠿'; h.title='Drag to reorder';
+      h.setAttribute('aria-label','Reorder the '+(el.dataset.panel||'')+' panel');
+      // Keyboard equivalent of a drag: move the panel within its container.
+      h.addEventListener('keydown',e=>{
+        const p=el.parentElement; if(!p) return;
+        if(e.key==='ArrowUp'||e.key==='ArrowLeft'){
+          const prev=el.previousElementSibling;
+          if(prev){ p.insertBefore(el,prev); saveOrder(); h.focus(); } e.preventDefault();
+        } else if(e.key==='ArrowDown'||e.key==='ArrowRight'){
+          const next=el.nextElementSibling;
+          if(next){ p.insertBefore(next,el); saveOrder(); h.focus(); } e.preventDefault();
+        }
+      });
       // draggable is enabled only while grabbing the handle, so text selection and
       // the panel resize grip keep working normally.
       h.addEventListener('mousedown',()=>el.setAttribute('draggable','true'));
@@ -1462,18 +2459,18 @@ const MBs=1/1048576;
 function initChartSpecs(){
   const R=cssVar('--read'), W=cssVar('--write'), A=cssVar('--accent');
   const set=(sel,spec)=>setSpec($(sel),spec);
-  set('#kReadSpark',  {title:'Total Read',       unit:'MB/s', scale:MBs, series:[{data:histR,color:R,fill:'rgba(74,163,255,.16)',label:'Read'}]});
-  set('#kWriteSpark', {title:'Total Write',      unit:'MB/s', scale:MBs, series:[{data:histW,color:W,fill:'rgba(188,140,255,.16)',label:'Write'}]});
-  set('#kIopsSpark',  {title:'Total IOPS',       unit:'IOPS',            series:[{data:histI,color:A,fill:'rgba(74,163,255,.16)',label:''}]});
+  set('#kReadSpark',  {title:'Total Read',       unit:'MB/s', scale:MBs, series:[{data:histR,color:R,fill:TC.readFillHi,label:'Read'}]});
+  set('#kWriteSpark', {title:'Total Write',      unit:'MB/s', scale:MBs, series:[{data:histW,color:W,fill:TC.writeFillHi,label:'Write'}]});
+  set('#kIopsSpark',  {title:'Total IOPS',       unit:'IOPS',            series:[{data:histI,color:A,fill:TC.readFillHi,label:''}]});
   set('#spark',       {title:'Total Throughput — all pool media', unit:'MB/s', scale:MBs, series:[
-    {data:histR,color:R,fill:'rgba(74,163,255,.13)',label:'Read'},
-    {data:histW,color:W,fill:'rgba(188,140,255,.13)',label:'Write'}]});
+    {data:histR,color:R,fill:TC.readFill,label:'Read'},
+    {data:histW,color:W,fill:TC.writeFill,label:'Write'}]});
   set('#kIoSizeSpark', {title:'Average I/O size', unit:'KB', scale:1/1024, series:[
     {data:histRSz,color:R,label:'Read'},{data:histWSz,color:W,label:'Write'}]});
   set('#kMixSpark',    {title:'Read / write balance', unit:'%', max:100, signed:true,
     fmtLabel:v=>Math.abs(v)<0.5?'even':(Math.abs(v).toFixed(0)+'% '+(v>0?'read':'write')),
     series:[{data:histMix,color:cssVar('--muted'),
-      fill:'rgba(74,163,255,.30)', fillNeg:'rgba(188,140,255,.30)', label:'Read bias'}]});
+      fill:TC.accentFill, fillNeg:TC.writeFillHi, label:'Read bias'}]});
   // CPU is sampled on the 1s system loop, so it needs the long window and its
   // own time scale — otherwise the zoom would label 30 min of data as 2 min.
   set('#kCpuSpark', {title:'CPU utilisation', unit:'%', max:100, maxPoints:SYSH, sampleMs:CFG.systemMs,
@@ -1490,12 +2487,43 @@ function initPanels(){
   });
   const save=()=>{ all().forEach(el=>{
     if(el.style.height){ try{ localStorage.setItem(K(el.dataset.pk),el.style.height); }catch(e){} } }); };
-  // A CSS resize drag always ends in a mouse/pointer-up. ResizeObserver is NOT
-  // reliable in every embedding context (it never fires in a non-painting tab),
-  // so persistence hangs off the pointer events instead.
-  document.addEventListener('mouseup',   ()=>setTimeout(save,60));
-  document.addEventListener('pointerup', ()=>setTimeout(save,60));
+  const repaint=()=>{ if(typeof drawSpark==='function') drawSpark(); };
+
+  // The browser's native CSS `resize` grip is drawn in the bottom-right corner —
+  // exactly where a full-bleed canvas paints over it, and it is clipped by the
+  // chart panels' overflow:hidden. So it was "on" but invisible. Replace it with
+  // an explicit handle that is always visible, works over the canvas, and drives
+  // the repaint that made the old version look broken even when it did resize.
+  all().forEach(el=>{
+    // Grip is the pbody's next sibling, not a child: a normal-flow bar below the
+    // body cannot overlap a scrolling table's rows or a chart's canvas.
+    if(el.nextElementSibling && el.nextElementSibling.classList.contains('reszgrip')) return;
+    const grip=document.createElement('div');
+    grip.className='reszgrip';
+    grip.title='Drag to resize';
+    grip.setAttribute('aria-hidden','true');
+    el.parentNode.insertBefore(grip, el.nextSibling);
+    let startY=0, startH=0, raf=0;
+    const onMove=e=>{
+      const h=Math.max(70, startH + ((e.touches?e.touches[0].clientY:e.clientY) - startY));
+      el.style.height=h+'px';
+      if(!raf) raf=requestAnimationFrame(()=>{ raf=0; repaint(); });
+    };
+    const onUp=()=>{
+      document.removeEventListener('pointermove',onMove);
+      document.removeEventListener('pointerup',onUp);
+      save(); repaint();
+    };
+    grip.addEventListener('pointerdown',e=>{
+      e.preventDefault();
+      startY=e.clientY; startH=el.getBoundingClientRect().height;
+      document.addEventListener('pointermove',onMove);
+      document.addEventListener('pointerup',onUp);
+    });
+  });
+
   window.addEventListener('beforeunload', save);
+  window.addEventListener('resize', repaint);
 }
 
 // ---- click-to-filter: scope the whole dashboard to one pool or space -------
@@ -1528,6 +2556,14 @@ function markActive(){
   document.querySelectorAll('[data-ft]').forEach(el=>{
     const on = filter && el.dataset.ft===filter.type && el.dataset.fk===filter.key;
     el.classList.toggle('factive', !!on);
+    // Filter targets are built by several different renders, so stamp
+    // focusability here rather than in six template literals that would each
+    // have to remember. Idempotent, and survives an innerHTML rewrite.
+    if(!el.hasAttribute('tabindex')){
+      el.setAttribute('tabindex','0');
+      el.setAttribute('role','button');
+    }
+    el.setAttribute('aria-pressed', on?'true':'false');
   });
 }
 document.addEventListener('click',e=>{
@@ -1653,7 +2689,15 @@ function drawChart(cv, spec){
     path(); ctx.strokeStyle=s.color; ctx.lineWidth=1.6*dpr; ctx.stroke();
   });
 }
-function drawSpark(){ const cv=$('#spark'); if(cv&&cv._spec) drawChart(cv,cv._spec); }
+// Repaints the full-size charts. Called after a theme switch, after a section is
+// shown, and after a layout change — anything that leaves a canvas holding stale
+// pixels or none at all. The history chart is included because it is only
+// otherwise refreshed once a minute, so a theme switch or a first reveal would
+// leave it blank or in the old palette until the next poll.
+function drawSpark(){
+  const cv=$('#spark'); if(cv&&cv._spec) drawChart(cv,cv._spec);
+  const hc=$('#histChart'); if(hc&&hc._spec&&visible(hc)) drawChart(hc,hc._spec);
+}
 
 // ---- zoom popup: double-click any graph ------------------------------------
 // A spec holds references to the live ring buffers, so the popup keeps updating
@@ -1696,9 +2740,88 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
 // Rebuilding innerHTML 10x/sec would trash the canvases and burn CPU, so rows
 // are only rebuilt when the set of disks actually changes.
 const dHist={}; const diskEls={}; let diskKey=null;
+// ---- peer-relative latency --------------------------------------------------
+// A drive that is DYING is usually slow long before it is unhealthy. Windows
+// will report HealthStatus: Healthy the entire time — there is no per-drive
+// "you are slower than you should be" signal anywhere in the storage stack.
+//
+// But a mirror or a parity set makes every member do near-identical work, so
+// the members ARE each other's control group. A drive running several times its
+// tier's median latency while the tier is busy is the single best pre-failure
+// signal available from data this dashboard already collects.
+//
+// Gating matters more than the maths. At idle, latencies are microseconds and
+// ratios are pure noise, so an ungated version would cry wolf on a quiet
+// Tuesday and get ignored — exactly the failure mode we designed the triage
+// severity table to avoid.
+const LAT_FLOOR_MS = 2.0;   // below this, a ratio is meaningless
+const LAT_OUTLIER  = 2.5;   // x median before we say anything
+const LAT_MIN_BUSY = 5;     // % — the tier must actually be doing work
+const LAT_MIN_PEERS= 3;     // need a real median, not a coin flip
+let latOutliers={};
+
+function peerLatency(disks){
+  const byTier={};
+  disks.filter(x=>isPoolMedia(x) && x.countersOk!==false).forEach(x=>{
+    const t=tierOf(x.mediaType); if(!t) return;
+    (byTier[t]||(byTier[t]=[])).push(x);
+  });
+  const out={};
+  for(const t in byTier){
+    const peers=byTier[t];
+    if(peers.length<LAT_MIN_PEERS) continue;
+    const worstLat=x=>{ const h=diskHist(x.diskNumber);
+      return Math.max(avgLast(h.rlat,MAXH), avgLast(h.wlat,MAXH)); };   // full window, not 500ms
+    const busyOf =x=>avgLast(diskHist(x.diskNumber).busy,MAXH);
+    const vals=peers.map(worstLat).filter(v=>v>0).sort((a,b)=>a-b);
+    if(vals.length<LAT_MIN_PEERS) continue;
+    const med=vals[Math.floor(vals.length/2)];
+    if(!(med>0)) continue;
+    const tierBusy=peers.reduce((a,x)=>a+busyOf(x),0)/peers.length;
+    if(tierBusy<LAT_MIN_BUSY) continue;      // quiet tier: say nothing
+    peers.forEach(x=>{
+      const v=worstLat(x);
+      if(v>=LAT_FLOOR_MS && v/med>=LAT_OUTLIER)
+        out[String(x.diskNumber)]={ratio:v/med, ms:v, med, tier:t, name:x.name};
+    });
+  }
+  return out;
+}
+
 function diskHist(dn){ const k=String(dn);
   return dHist[k]||(dHist[k]={busy:[],read:[],write:[],iops:[],queue:[],rlat:[],wlat:[]}); }
-const busyFill = p => p>=90?'rgba(248,81,73,.18)':p>=70?'rgba(210,153,34,.18)':'rgba(63,185,80,.18)';
+const busyFill = p => p>=90?TC.badFill:p>=70?TC.warnFill:TC.goodFill;
+
+// A failed drive stops having a PhysicalDisk counter instance. The sampler
+// rebuilds its counter table every 120s from GetInstanceNames(), and after that
+// rebuild the dead drive is simply not in the perf feed any more — so its row
+// VANISHED from the table. The single most alarming event on the system made
+// the evidence disappear, which is gotcha #9 in its purest form.
+//
+// The topology feed still knows about it (that is where "Lost Communication"
+// comes from). So the table is the UNION of what the counters report and what
+// the storage stack knows exists. A drive present in topology but missing from
+// perf is rendered as absent, not omitted.
+function withAbsentDrives(perfDisks){
+  const have=new Set(perfDisks.map(x=>String(x.diskNumber)));
+  const extra=[];
+  for(const k in topoDisks){
+    if(have.has(k)) continue;
+    const t=topoDisks[k]; if(!t) continue;
+    // same membership test filterDisks() uses, so an absent drive respects the
+    // active pool/space filter instead of leaking into a filtered view
+    if(filter){ const s=(filterSets[filter.type]||{})[filter.key]; if(s && !s.has(String(k))) continue; }
+    extra.push({
+      diskNumber:k, instance:'', name:t.name||('Disk '+k),
+      mediaType:t.mediaType||'Unknown', kind:'physical',
+      health:t.health||'', busType:t.busType||'', isSystem:false,
+      countersOk:false, absent:true, busy:null,
+      readBps:0, writeBps:0, reads:0, writes:0, queue:0,
+      readLatencyMs:0, writeLatencyMs:0
+    });
+  }
+  return extra.length ? perfDisks.concat(extra) : perfDisks;
+}
 
 function renderDisks(disks){
   const tb=$('#diskTbl tbody');
@@ -1736,9 +2859,16 @@ function renderDisks(disks){
   disks.forEach(x=>{
     const e=diskEls[String(x.diskNumber)]; if(!e) return;
     const h=diskHist(x.diskNumber);
-    push(h.busy,x.busy); push(h.read,x.readBps); push(h.write,x.writeBps);
-    push(h.iops,x.reads+x.writes); push(h.queue,x.queue);
-    push(h.rlat,x.readLatencyMs); push(h.wlat,x.writeLatencyMs);
+    // countersOk===false means this drive's perf counter instance stopped
+    // answering — which is what a PULLED DRIVE looks like for up to 120s, until
+    // the sampler rebuilds. Do NOT record it as history: zeros would read as an
+    // idle drive and the old 100-minus-idle arithmetic read as a pegged one.
+    const ctrDead = x.countersOk===false;
+    if(!ctrDead){
+      push(h.busy,x.busy); push(h.read,x.readBps); push(h.write,x.writeBps);
+      push(h.iops,x.reads+x.writes); push(h.queue,x.queue);
+      push(h.rlat,x.readLatencyMs); push(h.wlat,x.writeLatencyMs);
+    }
     const st=topoDisks[String(x.diskNumber)], sb=avgLast(h.busy);
 
     const top=e.tr.offsetTop, vis=shown && (top+e.tr.offsetHeight)>vTop && top<vBot;
@@ -1749,33 +2879,77 @@ function renderDisks(disks){
     setSpec(e.busyc,{title:who+' — Busy', unit:'%', max:100,
       series:[{data:h.busy,color:colorFor(sb),fill:busyFill(sb),label:'Busy'}]});
     setSpec(e.thruc,{title:who+' — Throughput', unit:'MB/s', scale:MBs, series:[
-      {data:h.read,color:rc,fill:'rgba(74,163,255,.13)',label:'Read'},
-      {data:h.write,color:wc,fill:'rgba(188,140,255,.13)',label:'Write'}]});
+      {data:h.read,color:rc,fill:TC.readFill,label:'Read'},
+      {data:h.write,color:wc,fill:TC.writeFill,label:'Write'}]});
     if(vis){
       drawMini(e.busyc,[{data:h.busy,color:colorFor(sb),fill:busyFill(sb)}],100);
       drawMini(e.thruc,[{data:h.read,color:rc},{data:h.write,color:wc}]);
     }
     // numbers are smoothed so they're actually readable
-    e.busyv.textContent=sb.toFixed(0)+'%'; e.busyv.style.color=busyColor(sb);
-    e.thruv.textContent=mbps(avgLast(h.read)).toFixed(1)+' / '+mbps(avgLast(h.write)).toFixed(1);
-    e.iops.textContent=num(avgLast(h.iops));
-    e.queue.textContent=avgLast(h.queue).toFixed(2);
-    e.lat.textContent=avgLast(h.rlat).toFixed(1)+'/'+avgLast(h.wlat).toFixed(1);
+    if(ctrDead){
+      // "?" — never 0 (reads as calm) and never 100 (reads as on fire).
+      const q='<span class="unkval">?</span>';
+      e.busyv.innerHTML=q; e.busyv.style.color='';
+      e.thruv.innerHTML=q; e.iops.innerHTML=q; e.queue.innerHTML=q; e.lat.innerHTML=q;
+      e.tr.title = x.absent
+        ? 'This drive has NO performance counter instance at all — the storage stack '
+         +'still lists it, but Windows is no longer collecting I/O for it. That is what '
+         +'a pulled or dead drive looks like once the sampler has rebuilt its counter table.'
+        : 'No counter data for this drive — the performance counter instance '
+         +'stopped responding. A pulled or failed drive looks exactly like this '
+         +'until the sampler rebuilds (up to 120s).';
+      e.tr.classList.toggle('absent', !!x.absent);
+    } else {
+      e.busyv.textContent=sb.toFixed(0)+'%'; e.busyv.style.color=busyColor(sb);
+      e.thruv.textContent=mbps(avgLast(h.read)).toFixed(1)+' / '+mbps(avgLast(h.write)).toFixed(1);
+      e.iops.textContent=num(avgLast(h.iops));
+      e.queue.textContent=avgLast(h.queue).toFixed(2);
+      e.lat.textContent=avgLast(h.rlat).toFixed(1)+'/'+avgLast(h.wlat).toFixed(1);
+      if(e.tr.title) e.tr.title='';
+      e.tr.classList.remove('absent');
+    }
 
     // slow-changing cells: only touch the DOM when the value actually changes
     const bt=(st&&st.busType)||x.busType||'';
+    // The bay goes in the SUBTITLE, not a new column: it is the thing you read
+    // last (once you already know which drive), and it must be next to the
+    // drive's name rather than eleven columns away at 2am.
+    const bay=(st&&st.bay)||'';
     const sub='#'+x.diskNumber+(bt?(' · '+bt):'')
+      +(bay?(' · '+bay):'')
       +(x.kind==='virtual'?' · space':'')+(x.isSystem?' · system':'');
     const usage=st?st.usage:'–', size=st?fmtBytes(st.size):'–';
     const wear=st?((st.wear==null?'–':st.wear+'%')+' / '+tempStr(st.tempC)):'–';
     const hv=x.health||(st?st.health:'');
+    // OperationalStatus: the field that actually names the failure. Shipped by
+    // the collector since day one, rendered here for the first time.
+    const ov=(st&&st.opStatus)||'';
+    const lo=latOutliers[String(x.diskNumber)];
+    const hk=hv+' '+ov+(ctrDead?' !':'')+(x.absent?' X':'')+' '+usage
+             +(lo?(' L'+lo.ratio.toFixed(1)):'');
     if(e._name!==x.name){ e.name.textContent=x.name; e._name=x.name; }
     if(e._sub!==sub){ e.sub.textContent=sub; e._sub=sub; }
     if(e._type!==x.mediaType){ e.type.innerHTML=typeTag(x.mediaType); e._type=x.mediaType; }
     if(e._usage!==usage){ e.usage.textContent=usage; e._usage=usage; }
     if(e._size!==size){ e.size.textContent=size; e._size=size; }
     if(e._wear!==wear){ e.wear.textContent=wear; e._wear=wear; }
-    if(e._health!==hv){ e.health.innerHTML=healthDot(hv); e._health=hv; }
+    if(e._health!==hk){
+      e.health.innerHTML=statusCell(hv,ov)
+        +(x.absent
+            ? '<span class="optag" style="color:var(--bad)" title="No performance counter instance exists for this drive">not reporting</span>'
+            : ctrDead
+              ? '<span class="optag" style="color:var(--muted)" title="Performance counter instance is not responding">no counter</span>'
+              : '')
+        // Usage is how a hot spare, a retired drive or a journal disk announces
+        // itself. Auto-Select is the normal case and is not worth a chip.
+        + (usage && !/^auto[- ]?select$/i.test(usage) && usage!=='–'
+            ? `<span class="optag" style="color:${/retired/i.test(usage)?'var(--warn)':'var(--accent)'}" title="PhysicalDisk Usage">${esc(usage)}</span>`
+            : '')
+        + (lo
+            ? `<span class="optag" style="color:var(--warn)" title="${lo.ms.toFixed(1)}ms vs a ${lo.tier} tier median of ${lo.med.toFixed(1)}ms. Windows will keep calling this drive Healthy.">${lo.ratio.toFixed(1)}x tier latency</span>`
+            : '');
+      e._health=hk;
+    }
   });
 }
 
@@ -1852,6 +3026,7 @@ function renderSpaces(disks){
       spaceEls[el.dataset.sk]={sub:el.querySelector('.s-sub'),stats:el.querySelector('.s-stats'),
         spark:el.querySelector('.s-spark'),busy:el.querySelector('.s-busy')};
     });
+    markActive();   // these rows are filter targets; re-stamp focusability
   }
   const rc=cssVar('--read'), wc=cssVar('--write');
   sp.forEach(x=>{
@@ -1866,8 +3041,8 @@ function renderSpaces(disks){
     e.busy.textContent=sb.toFixed(0)+'%'; e.busy.style.color=busyColor(sb);
     drawMini(e.spark,[{data:h.read,color:rc},{data:h.write,color:wc}],null,36);
     setSpec(e.spark,{title:x.name+' — Space I/O', unit:'MB/s', scale:MBs, series:[
-      {data:h.read,color:rc,fill:'rgba(74,163,255,.13)',label:'Read'},
-      {data:h.write,color:wc,fill:'rgba(188,140,255,.13)',label:'Write'}]});
+      {data:h.read,color:rc,fill:TC.readFill,label:'Read'},
+      {data:h.write,color:wc,fill:TC.writeFill,label:'Write'}]});
   });
 }
 
@@ -2189,7 +3364,7 @@ function renderPools(pools, vdisks, diag, ready, primordial, phys){
     const mine=(vdisks||[]).filter(v=>(v.diskNumbers||[]).some(n=>(p.diskNumbers||[]).includes(n)));
     return `<div style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-bottom:5px">
-        <span><b>${p.name}</b> <span class="muted">${(p.diskNumbers||[]).length} drives · ${healthDot(p.health)}</span></span>
+        <span><b>${p.name}</b> <span class="muted">${(p.diskNumbers||[]).length} drives · ${statusCell(p.health,p.opStatus)}</span></span>
         <span class="mono muted">${fmtBytes(p.allocated)} allocated of ${fmtBytes(p.size)}</span></div>
       <div class="effbar">
         <span style="width:${up}%;background:${up>90?'var(--bad)':up>75?'var(--warn)':'var(--accent)'}" title="allocated ${fmtBytes(p.allocated)}"></span>
@@ -2204,6 +3379,520 @@ function renderPools(pools, vdisks, diag, ready, primordial, phys){
 // ---- drive rollup (Drives tab). Split out so the °C/°F toggle can re-render
 // it instantly from the cached topology instead of waiting 30s for a refresh.
 let lastTopoData=null;
+// ---- triage rule registry ---------------------------------------------------
+// Each rule owns ONE concern and returns findings — {sev, what, name, why,
+// detail, rule} — for a context {pd, pools, vds, jobs, d, perf, lat}. This used
+// to be a 100-line wall of forEach/if inside renderTriage; as a registry each
+// concern is isolated, independently testable, and a new signal is a new entry
+// instead of a deeper function. A rule that throws is skipped, not fatal — one
+// broken signal must never blank the whole triage view.
+const TRIAGE_RULES = [
+  {
+    id:'health-opstatus',
+    // The core: HealthStatus + OperationalStatus across every object. The field
+    // that names the failure (opStatus) went unread for the life of the project.
+    run:({pd,pools,vds})=>{
+      const out=[];
+      const scan=(list,what)=>list.forEach(o=>{
+        const op=opParse(o.opStatus);
+        const hBad=isBadHealth(o.health), hWarn=isWarnHealth(o.health);
+        const sev = (op.sev==='bad'||hBad) ? 'bad'
+                  : (op.sev==='warn'||hWarn) ? 'warn'
+                  : (op.sev==='info') ? 'info'
+                  : (op.sev==='unknown') ? 'unknown' : null;
+        if(!sev) return;
+        out.push({ sev, what, name:o.name||('#'+(o.number!=null?o.number:'?')),
+          why: op.states.filter(s=>s.toLowerCase()!=='ok').join(' · ') || o.health || 'unknown state',
+          detail: o.health && o.health!=='Healthy' ? ('health: '+o.health) : '', rule:'opstatus' });
+      });
+      scan(pd,'drive'); scan(pools,'pool'); scan(vds,'space');
+      return out;
+    }
+  },
+  {
+    id:'pool-readonly',
+    // Read-only because the pool LOST QUORUM is a catastrophe; read-only because
+    // an admin set it is a Tuesday. Both used to render as the bare word.
+    run:({pools})=>pools.filter(p=>p.isReadOnly||reasonSev(p.readOnlyReason)).map(p=>{
+      const sev=reasonSev(p.readOnlyReason);
+      return { sev: sev==='bad'?'bad':sev==='info'?'info':'warn', what:'pool', name:p.name,
+        why:'read-only'+(p.readOnlyReason&&p.readOnlyReason!=='None'?(' — '+p.readOnlyReason):''),
+        detail: /incomplete/i.test(p.readOnlyReason||'') ? 'the pool lost quorum: most drives are missing or offline'
+          : /policy/i.test(p.readOnlyReason||'') ? 'an administrator set this; Set-StoragePool -IsReadOnly $false to clear'
+          : 'no writes are possible until this clears', rule:'readonly' };
+    })
+  },
+  {
+    id:'vdisk-detached',
+    run:({vds})=>vds.filter(v=>reasonSev(v.detachedReason)).map(v=>({
+      sev:reasonSev(v.detachedReason), what:'space', name:v.name, why:'detached — '+v.detachedReason,
+      detail: /majority/i.test(v.detachedReason) ? 'too many drives failed, are missing, or hold stale data'
+        : /policy/i.test(v.detachedReason) ? 'taken offline deliberately; Connect-VirtualDisk to reattach'
+        : /timeout/i.test(v.detachedReason) ? 'attaching took too long; try Disconnect- then Connect-VirtualDisk'
+        : 'not enough drives are present to read it', rule:'detached' }))
+  },
+  {
+    id:'temperature',
+    // Judged against each drive's OWN rated maximum, not a fixed number — a temp
+    // that alarms for a spindle is normal for an NVMe.
+    run:({pd})=>{
+      const out=[];
+      pd.forEach(p=>{
+        if(p.tempC==null || !p.tempMaxC) return;
+        const pct=p.tempC/p.tempMaxC;
+        if(pct>=1.0) out.push({sev:'bad',what:'drive',name:p.name,
+          why:Math.round(p.tempC)+'°C — at or over its rated max', detail:'rated maximum is '+Math.round(p.tempMaxC)+'°C', rule:'temp'});
+        else if(pct>=0.9) out.push({sev:'warn',what:'drive',name:p.name,
+          why:Math.round(p.tempC)+'°C — within 10% of its rated max', detail:'rated maximum is '+Math.round(p.tempMaxC)+'°C', rule:'temp'});
+      });
+      return out;
+    }
+  },
+  {
+    id:'smart-predict',
+    // The drive firmware's own failure flag — distinct from Storage Spaces'
+    // "Predictive Failure", and Spaces does not always surface it.
+    run:({d})=>(d.smart && d.smart.failing>0) ? [{ sev:'bad', what:'smart', name:'SMART',
+      why:d.smart.failing+' drive(s) predicting failure',
+      detail:'reported by drive firmware, not by Storage Spaces — check Get-CimInstance -Namespace root\\wmi MSStorageDriver_FailurePredictStatus',
+      rule:'predict' }] : []
+  },
+  {
+    id:'refs-integrity',
+    run:({d})=>{
+      const ig=d.integrity; if(!ig) return [];
+      const out=[];
+      (ig.events||[]).filter(e=>/error|critical/i.test(e.level)).slice(0,5).forEach(e=>
+        out.push({sev:'bad',what:'integrity',name:'ReFS',why:e.src.replace('Microsoft-Windows-','')+' event '+e.id,detail:e.msg,rule:'event'+e.id}));
+      if(ig.scan){
+        const lr=ig.scan.lastRun?new Date(ig.scan.lastRun):null;
+        const days=lr?Math.round((Date.now()-lr.getTime())/86400000):null;
+        if(days===null) out.push({sev:'warn',what:'integrity',name:'Data Integrity Scan',why:'has never run',detail:'nothing has verified file data on this machine',rule:'scan-stale'});
+        else if(days>45) out.push({sev:'warn',what:'integrity',name:'Data Integrity Scan',why:'last ran '+days+' days ago',detail:'default cadence is 4 weeks',rule:'scan-stale'});
+        else if(ig.scan.lastResult!==0 && ig.scan.lastResult!=null && ig.scan.lastResult!==267011)
+          out.push({sev:'warn',what:'integrity',name:'Data Integrity Scan',why:'last run failed (0x'+(ig.scan.lastResult>>>0).toString(16)+')',detail:'',rule:'scan-result'});
+      }
+      return out;
+    }
+  },
+  {
+    id:'needs-regen',
+    // Degraded data a "Healthy" rollup will not tell you about.
+    run:({vds})=>vds.map(v=>{
+      const n=(v.needsRegen||0)+(v.stale||0)+(v.missing||0);
+      return n>0 ? {sev:'warn',what:'space',name:v.name,why:fmtBytes(n)+' needs regeneration',detail:'resiliency is reduced',rule:'regen'} : null;
+    }).filter(Boolean)
+  },
+  {
+    id:'dead-counter',
+    // A drive whose perf counter stopped answering — what a pulled drive looks
+    // like for up to 120s before the topology feed catches up.
+    run:({perf})=>((perf&&perf.disks)||[]).filter(x=>x.countersOk===false).map(x=>({
+      sev:'warn',what:'drive',name:x.name||('#'+x.diskNumber),
+      why:'performance counter not responding',detail:'a pulled or failed drive looks exactly like this',rule:'counter'}))
+  },
+  {
+    id:'peer-latency',
+    // Several times slower than its own mirror partners while Windows still says
+    // Healthy — the only pre-failure signal on the page.
+    run:({lat})=>Object.keys(lat||{}).map(k=>{
+      const o=lat[k];
+      return {sev:'warn',what:'drive',name:o.name||('#'+k),why:o.ratio.toFixed(1)+'x its tier latency',
+        detail:o.ms.toFixed(1)+'ms vs '+o.med.toFixed(1)+'ms median — health still reads OK',rule:'latency'};
+    })
+  },
+  {
+    id:'jobs',
+    run:({jobs})=>jobs.map(j=>({sev:'info',what:'job',name:j.name||'storage job',
+      why:(j.description||j.state||'running')+(j.percent!=null?(' · '+j.percent.toFixed(0)+'%'):''),detail:'',rule:'job'}))
+  }
+];
+
+// ---- triage ----------------------------------------------------------------
+// Computed, never curated. Runs every TRIAGE_RULE, ranks the findings worst
+// first, applies per-machine severity overrides, and renders. The rules live in
+// TRIAGE_RULES above; this function is now just orchestration and rendering.
+function renderTriage(d, perf){
+  const el=$('#triageBody'); if(!el) return;
+  const pd=d.physicalDisks||[], pools=d.pools||[], vds=d.virtualDisks||[], jobs=(perf&&perf.jobs)||[];
+  let items=[];
+  const rank={bad:0,warn:1,info:2,unknown:3,muted:4};
+
+  // Every finding carries a STABLE rule key so you can tell the dashboard that
+  // this particular thing is not an emergency on this machine. The key is
+  // deliberately (what, name, rule) and not the message text — otherwise
+  // rewording a string would silently un-mute something you had dealt with.
+  const add=(sev,what,name,why,detail,rule)=>{
+    const key=[what,name,rule||'state'].join('/');
+    const override=alertRules[key];
+    items.push({
+      sev: override==='hidden' ? 'hidden' : (override || sev),
+      natural: sev, key, muted: !!override,
+      what, name, why, detail: detail||''
+    });
+  };
+
+  // Bay lookup for triage rows: knowing LAB-SSD-02 is dead is not the answer
+  // when you are standing in front of the rack.
+  const bayOf=n=>{ const p=pd.find(x=>x.name===n||('#'+x.number)===n); return (p&&p.bay)||''; };
+
+  // Every rule in TRIAGE_RULES returns findings for one concern. Feed each
+  // through add() so severity overrides and stable keys apply uniformly.
+  const cx = { pd, pools, vds, jobs, d, perf, lat: latOutliers };
+  for(const rule of TRIAGE_RULES){
+    let found;
+    try { found = rule.run(cx) || []; }
+    catch(e){ if(window.console) console.error('triage rule "'+rule.id+'" threw:', e); continue; }
+    for(const f of found) add(f.sev, f.what, f.name, f.why, f.detail, f.rule);
+  }
+
+  // Hidden items are removed from the ranked list but COUNTED. A suppressed
+  // finding that leaves no trace is the exact defect this dashboard exists to
+  // fix — silence that looks like reassurance. There is always a visible
+  // "N suppressed" affordance and one click brings them back.
+  const hiddenItems = items.filter(i=>i.sev==='hidden');
+  items = items.filter(i=>i.sev!=='hidden');
+  if(showSuppressed) items = items.concat(hiddenItems.map(i=>({...i, sev:'muted'})));
+
+  const rankOf=i=>rank[i.sev]!=null?rank[i.sev]:5;
+  items.sort((a,b)=>rankOf(a)-rankOf(b));
+
+  const worst = items.length ? items[0].sev : null;
+  const nd=$('#ndTriage'), nav=$('#navTriage'), sec=$('#triageSec'), nb=$('#nbTriage');
+  const actionable = items.filter(i=>i.sev==='bad'||i.sev==='warn').length;
+  if(nav){
+    // The entry only exists when there is something to triage. An always-present
+    // "Triage: all clear" is a thing you stop reading. It also appears once any
+    // state has CHANGED, even if everything is healthy again — "a drive dropped
+    // and came back" is exactly the thing you want to find out about later.
+    const show = items.length>0 || ((d.events||[]).length>0);
+    nav.style.display = show?'':'none';
+    if(sec) sec.style.display = show?'':'none';
+    if(nb) nb.textContent = actionable || '';
+    if(nd) nd.className = 'ndot' + (worst==='bad'?' bad':worst==='warn'?' warn':'');
+    nav.classList.toggle('alert', worst==='bad');
+    nav.classList.toggle('warnstate', worst==='warn');
+  }
+
+  // Always visible, even when everything is clear: suppression must never be
+  // invisible, or you have built the thing this project keeps deleting.
+  const suppressedBar = hiddenItems.length
+    ? `<div class="supbar">${hiddenItems.length} finding${hiddenItems.length===1?'':'s'} suppressed on this machine`
+      + `<button type="button" id="supToggle">${showSuppressed?'hide them':'show them'}</button></div>`
+    : '';
+
+  if(!items.length){
+    el.innerHTML='<div style="display:flex;align-items:center;gap:10px;padding:6px 0">'
+      +'<span class="dot" style="background:var(--good)"></span>'
+      +'<span>Nothing needs attention.</span>'
+      +'<span class="muted">'+pd.length+' drives, '+pools.length+' pool'+(pools.length===1?'':'s')
+      +', '+vds.length+' space'+(vds.length===1?'':'s')+' checked.</span></div>'
+      + suppressedBar;
+    wireTriageControls();
+    return;
+  }
+  const col=s=>s==='bad'?'var(--bad)':s==='warn'?'var(--warn)':s==='unknown'?'var(--muted)'
+              :s==='muted'?'var(--border)':'var(--accent)';
+  el.innerHTML=items.map(i=>{
+    const bay = i.what==='drive' ? bayOf(i.name) : '';
+    const dn  = i.sev==='muted';
+    return `<div class="trow${dn?' rmuted':''}" style="border-left:3px solid ${col(i.sev)}">
+      <span class="tkind">${esc(i.what)}</span>
+      <b>${esc(i.name)}</b>
+      ${bay?`<span class="baytag" title="Physical location">${esc(bay)}</span>`:''}
+      <span class="twhy" style="color:${col(i.sev)}">${esc(i.why)}</span>
+      ${i.detail?`<span class="muted">${esc(i.detail)}</span>`:''}
+      ${i.muted?`<span class="mutetag" title="Severity overridden on this machine">${dn?'suppressed':esc(i.sev)}</span>`:''}
+      ${(()=>{ const f=fixFor(i); if(!f) return '';
+        return `<span class="fixrow">`
+          + (f.note?`<span class="fixnote">${esc(f.note)}</span>`:'')
+          + (f.cmd?`<code class="fixcmd">${esc(f.cmd)}</code>`
+                  +`<button type="button" class="ract fixcopy" data-cmd="${esc(f.cmd)}">copy</button>`:'')
+          + (f.doc?`<a class="ract" href="${esc(f.doc)}" target="_blank" rel="noopener noreferrer">docs ↗</a>`:'')
+          + `</span>`; })()}
+      ${alertsEditable?`<span class="rowacts">
+        ${i.muted
+          ? `<button type="button" class="ract" data-rule="${esc(i.key)}" data-level="">restore</button>`
+          : `<button type="button" class="ract" data-rule="${esc(i.key)}" data-level="info" title="Keep showing it, but not as a problem">not critical</button>
+             <button type="button" class="ract" data-rule="${esc(i.key)}" data-level="hidden" title="Suppress it (still counted below)">suppress</button>`}
+      </span>`:''}
+    </div>`;
+  }).join('') + suppressedBar;
+  wireTriageControls();
+}
+
+// Severity overrides are per-machine judgement, stored server-side, loopback-only
+// to change — the same rule as bays and identify.
+function wireTriageControls(){
+  const t=$('#supToggle');
+  if(t) t.addEventListener('click',()=>{ showSuppressed=!showSuppressed; if(lastTopoData) renderTriage(lastTopoData,lastPerfData); });
+  document.querySelectorAll('#triageBody .fixcopy').forEach(b=>{
+    b.addEventListener('click',()=>copyText(b.dataset.cmd, b));
+  });
+  document.querySelectorAll('#triageBody .ract[data-rule]').forEach(b=>{
+    b.addEventListener('click',async ()=>{
+      b.disabled=true;
+      try{
+        const r=await fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({key:b.dataset.rule, level:b.dataset.level})});
+        if(!r.ok){ b.textContent='failed'; b.title='HTTP '+r.status; b.disabled=false; return; }
+        if(b.dataset.level) alertRules[b.dataset.rule]=b.dataset.level;
+        else delete alertRules[b.dataset.rule];
+        if(lastTopoData) renderTriage(lastTopoData,lastPerfData);
+      }catch(e){ b.textContent='failed'; b.title=String(e&&e.message||e); b.disabled=false; }
+    });
+  });
+}
+
+// ---- event timeline ---------------------------------------------------------
+// Newest first, because during an incident the last thing that happened is the
+// thing you are staring at, and you read BACKWARDS to find the cause.
+function renderTimeline(d){
+  const el=$('#timelineBody'); if(!el) return;
+  const ev=(d.events||[]).slice().reverse();
+  if(!ev.length){
+    el.innerHTML='<span class="muted">No state changes recorded since the dashboard started.</span>';
+    return;
+  }
+  // Severity of a transition is the severity of where it ENDED, except a
+  // disappearance which is always bad regardless of what it looked like before.
+  const sevOf=e=>{
+    if(e.verb==='disappeared') return 'bad';
+    const parts=String(e.to||'').split('/').map(s=>s.trim());
+    const op=opParse(parts[1]||'');
+    if(op.sev==='bad'||isBadHealth(parts[0])) return 'bad';
+    if(op.sev==='warn'||isWarnHealth(parts[0])) return 'warn';
+    if(op.sev==='info') return 'info';
+    return 'ok';
+  };
+  const col=s=>s==='bad'?'var(--bad)':s==='warn'?'var(--warn)':s==='info'?'var(--accent)':'var(--good)';
+  const t0=ev.length?new Date(ev[0].t).getTime():0;
+  el.innerHTML=ev.slice(0,60).map(e=>{
+    const s=sevOf(e), when=new Date(e.t);
+    const ago=Math.round((t0-when.getTime())/1000);
+    // Seconds up to ten minutes. An incident's whole causal chain usually fits
+    // inside a couple of minutes, and rounding it to whole minutes destroys the
+    // ordering that is the entire point of this panel — two events five seconds
+    // apart rendered as "-3m" and "-2m" and looked a minute apart.
+    const rel = ago<=0 ? 'latest' : ago<600 ? ('-'+ago+'s') : ago<3600 ? ('-'+Math.round(ago/60)+'m') : ('-'+(ago/3600).toFixed(1)+'h');
+    const change = e.verb==='changed'
+      ? `<span class="muted">${esc(e.from)}</span> <span class="muted">→</span> <span style="color:${col(s)}">${esc(e.to)}</span>`
+      : e.verb==='appeared'
+        ? `<span style="color:${col(s)}">appeared as ${esc(e.to)}</span>`
+        : `<span style="color:var(--bad)">disappeared</span> <span class="muted">(was ${esc(e.from)})</span>`;
+    return `<div class="trow" style="border-left:3px solid ${col(s)}">
+      <span class="tkind mono">${when.toLocaleTimeString()}</span>
+      <span class="tkind">${esc(e.kind)}</span>
+      <b>${esc(e.name)}</b>
+      ${change}
+      <span class="muted mono">${rel}</span>
+    </div>`;
+  }).join('');
+}
+
+// ---- server-recorded history ------------------------------------------------
+// Fetched on load and then slowly, NOT on the realtime cadence: at 37 drives
+// this payload is around a megabyte, and it exists to answer "what did the run
+// up to now look like", which does not change ten times a second.
+const histT=[], histTr=[], histTw=[];
+let histSeeded=false;
+async function pollHistory(){
+  const h = await getJson('/api/history');
+  if(!h) return;
+  const n=(h.t||[]).length;
+  histT.length=0; histTr.length=0; histTw.length=0;
+  (h.totals&&h.totals.r||[]).forEach(v=>histTr.push(v));
+  (h.totals&&h.totals.w||[]).forEach(v=>histTw.push(v));
+  (h.t||[]).forEach(v=>histT.push(v));
+  const c=$('#histChart');
+  if(c){
+    setSpec(c,{title:'Last 15 minutes — throughput', unit:'MB/s', scale:MBs,
+      sampleMs:h.sampleMs||1000, maxPoints:900,
+      series:[{data:histTr,color:TC.read, fill:TC.readFill, label:'Read'},
+              {data:histTw,color:TC.write,fill:TC.writeFill,label:'Write'}]});
+    // drawChart takes (canvas, SPEC). Calling it with one argument hit
+    // `if(!cv||!spec||!spec.series) return;` and painted nothing — while
+    // double-click still worked, because the zoom modal passes the spec
+    // explicitly. A blank canvas next to a subtitle reading "174 samples"
+    // is exactly the confident-but-wrong rendering this project keeps fixing.
+    if(visible(c)) drawChart(c, c._spec);
+  }
+  const sub=$('#histSub');
+  if(sub){
+    if(!n){ sub.textContent='No history yet — the server has been up less than a second.'; }
+    else {
+      const secs=n*((h.sampleMs||1000)/1000);
+      const peak=Math.max(maxOf(histTr),maxOf(histTw));
+      sub.textContent = `${n} sample${n===1?'':'s'} · ${secs<60?Math.round(secs)+'s':Math.round(secs/60)+' min'} recorded · `
+        + `peak ${mbps(peak).toFixed(1)} MB/s`
+        + (n>=900?' · window full (oldest samples are being dropped)':'');
+    }
+  }
+  histSeeded=true;
+  renderForecast(h.capacity||{});
+}
+
+// ---- capacity forecast ------------------------------------------------------
+// Least-squares fit over the allocation series. Deliberately refuses to answer
+// rather than extrapolating from noise: a pool that has not moved, or has only
+// a few minutes of history, gets "not enough signal" instead of a confident
+// number. A wrong date here is worse than no date.
+function renderForecast(cap){
+  const el=$('#forecastBody'); if(!el) return;
+  const names=Object.keys(cap||{});
+  if(!names.length){
+    el.innerHTML='<span class="muted">No pool allocation history yet.</span>';
+    return;
+  }
+  const rows=names.map(name=>{
+    const pts=(cap[name]||[]).filter(p=>p&&p.t!=null&&p.alloc!=null);
+    const size=pts.length?pts[pts.length-1].size:0;
+    const used=pts.length?pts[pts.length-1].alloc:0;
+    const pct=size>0?(used/size*100):0;
+    if(pts.length<10) return {name,size,used,pct,verdict:'not enough history yet',sev:'muted',
+                              detail:pts.length+' sample(s) — needs ~10 minutes'};
+    // least squares on (seconds, bytes)
+    const t0=pts[0].t;
+    const xs=pts.map(p=>p.t-t0), ys=pts.map(p=>p.alloc);
+    const n=xs.length, sx=xs.reduce((a,b)=>a+b,0), sy=ys.reduce((a,b)=>a+b,0);
+    const sxx=xs.reduce((a,b)=>a+b*b,0), sxy=xs.reduce((a,b,i)=>a+b*ys[i],0);
+    const den=n*sxx-sx*sx;
+    if(!den) return {name,size,used,pct,verdict:'flat',sev:'good',detail:'allocation is not changing'};
+    const slope=(n*sxy-sx*sy)/den;                 // bytes per second
+    const perDay=slope*86400;
+    if(Math.abs(perDay) < size*0.0005)             // <0.05% of the pool per day
+      return {name,size,used,pct,verdict:'stable',sev:'good',
+              detail:'no meaningful growth over '+Math.round((xs[n-1])/60)+' min of history'};
+    if(perDay<0)
+      return {name,size,used,pct,verdict:'shrinking',sev:'good',
+              detail:'freeing '+fmtBytes(-perDay)+'/day'};
+    const days=(size-used)/perDay;
+    const sev = days<14?'bad':days<60?'warn':'good';
+    return {name,size,used,pct,sev,
+            verdict:(days<1?'full in under a day':'~'+(days<30?Math.round(days):Math.round(days))+' days to full'),
+            detail:'growing '+fmtBytes(perDay)+'/day · based on '+Math.round(xs[n-1]/60)+' min of history'};
+  });
+  const col=s=>s==='bad'?'var(--bad)':s==='warn'?'var(--warn)':s==='good'?'var(--good)':'var(--muted)';
+  el.innerHTML=rows.map(r=>`<div class="trow" style="border-left:3px solid ${col(r.sev)}">
+      <span class="tkind">pool</span><b>${esc(r.name)}</b>
+      <span class="twhy" style="color:${col(r.sev)}">${esc(r.verdict)}</span>
+      <span class="muted">${esc(r.detail)}</span>
+      <span class="muted mono">${fmtBytes(r.used)} / ${fmtBytes(r.size)} · ${r.pct.toFixed(0)}%</span>
+    </div>`).join('');
+}
+
+// ---- physical bay map -------------------------------------------------------
+// Editable only from loopback — the server enforces it, this just reflects it.
+// The whole point is knowledge a human supplies once while standing in front of
+// the rack, so it is keyed on the SERIAL NUMBER: the identifier printed on the
+// drive itself, which survives reboots, re-cabling, and moving the disk to a
+// different port. Everything else about a drive moves (see: the entire lab).
+let bayEditable=false, bayPath='', bayKey=null;
+// Per-machine severity overrides for triage findings.
+let alertRules={}, alertsEditable=false, alertsPath='', showSuppressed=false;
+async function loadAlerts(){
+  const a = await getJson('/api/alerts');
+  if(!a) return;
+  alertRules = a.rules || {};
+  alertsEditable = !!a.editable;
+  alertsPath = a.path || '';
+  if(lastTopoData) renderTriage(lastTopoData, lastPerfData);
+}
+function bayKeyOf(p){ return (p.serial&&p.serial.trim()) || p.uniqueId || ''; }
+
+async function loadBays(){
+  const b = await getJson('/api/bays');
+  if(!b) return;
+  bayEditable = !!b.editable; bayPath = b.path||'';
+  const hint=$('#bayHint');
+  if(hint){
+    hint.innerHTML = bayEditable
+      ? `Editing enabled — you are on the machine itself. Saved to <span class="mono">${esc(bayPath)}</span> as you type.`
+      : `<span style="color:var(--warn)">Read-only.</span> Bay labels can only be edited from the console of this machine, `
+        +`not over the network. Edit <span class="mono">${esc(bayPath)}</span> directly, or open the dashboard on the box.`;
+  }
+}
+async function saveBay(key, label, inputEl){
+  try{
+    const r = await fetch('/api/bays',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key,bay:label})});
+    if(!r.ok){
+      // Never let a failed save look like a successful one — that is the whole
+      // disease this project has been fixing all night.
+      inputEl.style.borderColor='var(--bad)';
+      inputEl.title='Save FAILED: HTTP '+r.status+(r.status===403?' — editing is loopback-only':'');
+      return;
+    }
+    inputEl.style.borderColor='var(--good)';
+    inputEl.title='Saved to '+bayPath;
+    setTimeout(()=>{ inputEl.style.borderColor=''; },1200);
+  }catch(e){
+    inputEl.style.borderColor='var(--bad)';
+    inputEl.title='Save failed: '+(e&&e.message||e);
+  }
+}
+
+function renderBayMap(d){
+  const tb=document.querySelector('#bayTbl tbody'); if(!tb) return;
+  // Real pool media only: virtual disks have no drawer.
+  const pd=(d.physicalDisks||[]).filter(p=>!/^space$/i.test(p.mediaType));
+  if(!pd.length){ tb.innerHTML='<tr><td colspan="5" class="muted">No physical disks reported.</td></tr>'; return; }
+  const key=pd.map(p=>bayKeyOf(p)).join('|');
+  if(key===bayKey) return;              // don't rebuild under the user's cursor
+  bayKey=key;
+  tb.innerHTML=pd.map(p=>{
+    const k=bayKeyOf(p);
+    const hw=[p.enclosure!==''?('encl '+p.enclosure):'', p.slot!==''?('slot '+p.slot):'', p.physLoc]
+             .filter(Boolean).join(' · ') || '—';
+    return `<tr>
+      <td><b>${esc(p.name)}</b><div class="muted mono" style="font-size:11px">#${esc(String(p.number))}</div></td>
+      <td>${typeTag(p.mediaType)}</td>
+      <td><input data-baykey="${esc(k)}" value="${esc(p.bay||'')}"
+            placeholder="${bayEditable?'e.g. shelf 2 bay 7':'read-only'}"
+            ${bayEditable?'':'disabled'} aria-label="Bay for ${esc(p.name)}"></td>
+      <td class="mono muted" style="font-size:11px">${esc(p.serial||'—')}</td>
+      <td class="muted" style="font-size:11px">${esc(hw)}
+        ${bayEditable?`<button type="button" class="blinkbtn" data-uid="${esc(p.uniqueId||'')}"
+           title="Flash this drive's identify LED for 30s (needs an SES enclosure)">blink</button>`:''}</td>
+    </tr>`;
+  }).join('');
+  if(bayEditable){
+    tb.querySelectorAll('input[data-baykey]').forEach(inp=>{
+      let t=null;
+      inp.addEventListener('input',()=>{ clearTimeout(t);
+        t=setTimeout(()=>saveBay(inp.dataset.baykey, inp.value, inp), 600); });
+      inp.addEventListener('blur',()=>{ clearTimeout(t); saveBay(inp.dataset.baykey, inp.value, inp); });
+    });
+    // Identify LED. The hardware pointing at itself beats any map you could
+    // write — when the hardware can do it. When it can't, say so on the button
+    // rather than flashing a success state for a light that never lit.
+    tb.querySelectorAll('.blinkbtn').forEach(b=>{
+      b.addEventListener('click',async ()=>{
+        const was=b.textContent;
+        b.disabled=true; b.textContent='…';
+        try{
+          const r=await fetch('/api/identify',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({uniqueId:b.dataset.uid,seconds:30})});
+          const j=await r.json().catch(()=>({}));
+          if(r.ok && j.ok){
+            b.textContent='blinking';
+            b.classList.add('on');
+            setTimeout(()=>{ b.textContent=was; b.classList.remove('on'); b.disabled=false; }, (j.seconds||30)*1000);
+            return;
+          }
+          b.textContent='unsupported';
+          b.classList.add('bad');
+          b.title = j.error || ('HTTP '+r.status);
+          setTimeout(()=>{ b.textContent=was; b.classList.remove('bad'); b.disabled=false; }, 4000);
+        }catch(e){
+          b.textContent='failed'; b.classList.add('bad'); b.title=String(e&&e.message||e);
+          setTimeout(()=>{ b.textContent=was; b.classList.remove('bad'); b.disabled=false; }, 4000);
+        }
+      });
+    });
+  }
+}
+
 function applyTopoDerived(d){
   const pd=d.physicalDisks||[];
   const healthy=pd.filter(p=>isOkHealth(p.health)).length;
@@ -2309,15 +3998,15 @@ function renderTierMove(tiers){
     if(tB>0||(t.ops||0)>0) anyActive=true;
 
     if(visible($('#tierMove'))){
-      drawMini(e.spark,[{data:h.read,color:rc,fill:'rgba(74,163,255,.14)'},
-                        {data:h.write,color:wc,fill:'rgba(188,140,255,.14)'}],null,56,SYSH);
+      drawMini(e.spark,[{data:h.read,color:rc,fill:TC.readFill},
+                        {data:h.write,color:wc,fill:TC.writeFill}],null,56,SYSH);
     }
     // Direction matters: a READ on a tier means data is leaving it (being
     // promoted/demoted elsewhere); a WRITE means data is landing on it.
     setSpec(e.spark,{title:(t.instance||'tier')+' — Tier movement', unit:'MB/s', scale:MBs,
       maxPoints:SYSH, sampleMs:CFG.systemMs, series:[
-        {data:h.read,color:rc,fill:'rgba(74,163,255,.14)',label:'Read off this tier'},
-        {data:h.write,color:wc,fill:'rgba(188,140,255,.14)',label:'Written to this tier'}]});
+        {data:h.read,color:rc,fill:TC.readFill,label:'Read off this tier'},
+        {data:h.write,color:wc,fill:TC.writeFill,label:'Written to this tier'}]});
 
     const idle = tB<=0 && (t.ops||0)<=0;
     e.sub.textContent = idle ? 'idle' : 'moving data';
@@ -2427,15 +4116,60 @@ function renderSystem(s){
     }).join('');
   } else { $('#repairWrap').style.display='none'; }
 }
+// ---- connection state -------------------------------------------------------
+// fetch() DOES NOT REJECT on 4xx/5xx — it only rejects on a network failure. So
+// `try{ await fetch(...) }catch{}` treats a 401 or a 500 as a completely
+// successful request. The header dot used to be painted green and labelled
+// "live" immediately after r.json() resolved, having established nothing except
+// that a body parsed. The handler's own error path returns a VALID JSON body
+// ({"error":...}) with status 500, so a server-side exception produced a green
+// "live" dot and an "Invalid Date" clock. Three different failures, one green
+// light. They are separated here and must never be collapsed again:
+//   401  -> your session died. Auth, not storage.
+//   5xx  -> the server is broken. Not the array.
+//   throw-> the box is unreachable. Say how stale the screen is.
+function setConn(state, detail){
+  const el=$('#conn'); if(!el) return;
+  const c = state==='live' ? 'var(--good)' : state==='stale' ? 'var(--warn)' : 'var(--bad)';
+  const label = state==='live' ? 'live'
+              : state==='servererr' ? 'server error'
+              : state==='authfail' ? 'not authorised'
+              : 'disconnected';
+  el.innerHTML=`<span class="dot" style="background:${c}"></span>${label}`;
+  el.title = detail || '';
+}
+// A non-OK response is never data. Returns null and paints the reason.
+async function getJson(url){
+  let r;
+  try{ r = await fetch(url); }
+  catch(e){ setConn('down','Cannot reach '+url+' — '+(e&&e.message||'network error')); return null; }
+  if(r.status===401){ setConn('authfail','Session expired or key rotated ('+url+')'); return null; }
+  if(!r.ok){ setConn('servererr','HTTP '+r.status+' from '+url+' — this is the dashboard process, not your storage'); return null; }
+  try{ return await r.json(); }
+  catch(e){ setConn('servererr','Malformed response from '+url); return null; }
+}
+
 async function pollSystem(){
-  try{ const r=await fetch('/api/system'); renderSystem(await r.json()); }catch(e){}
+  const d = await getJson('/api/system');
+  if(d){ FEED_AT.system = Date.now(); renderSystem(d); }
 }
 
 async function pollPerf(){
+  const d = await getJson('/api/perf');
+  if(!d) return;                       // reason already painted by getJson
   try{
-    const r=await fetch('/api/perf'); const d=await r.json();
-    $('#conn').innerHTML='<span class="dot" style="background:var(--good)"></span>live';
-    $('#clock').textContent=new Date(d.timestamp).toLocaleTimeString();
+    // Only NOW is "live" an established fact.
+    setConn('live');
+    FEED_AT.perf = Date.now();
+    // A drive whose counter instance vanished is visible here up to 5s before
+    // the topology feed notices, so triage re-runs on the fast feed when the
+    // set of failing drives changes.
+    const prevBad = lastPerfData ? lastPerfData.disks.filter(x=>x.countersOk===false).length : 0;
+    lastPerfData = d;
+    const nowBad = d.disks.filter(x=>x.countersOk===false).length;
+    if(nowBad!==prevBad && lastTopoData) renderTriage(lastTopoData, d);
+    const ts=d.timestamp?new Date(d.timestamp):null;
+    $('#clock').textContent=(ts && !isNaN(ts)) ? ts.toLocaleTimeString() : '–';
     $('#feeds').textContent=(d.mapped===false?'mapping drives… · ':'')
       +'topology '+(lastTopoAt?Math.round((Date.now()-lastTopoAt)/1000)+'s':'—')
       +' · '+poolState+' · layout '+layoutState+' · wear '+wearState;
@@ -2456,7 +4190,13 @@ async function pollPerf(){
     }
 
     // these also append to the per-disk / per-tier ring buffers
-    renderDisks(disks);
+    // The disk TABLE gets the absent drives merged in; the aggregate views do
+    // NOT — a drive that is gone contributes no I/O and must not drag a tier
+    // average toward zero.
+    // Recomputed here (not in renderDisks) because renderDisks receives the
+    // absent drives merged in, and a drive with no counters has no latency.
+    latOutliers = peerLatency(disks);
+    renderDisks(withAbsentDrives(disks));
     renderTierActivity(disks);
     renderSpaces(disks);
 
@@ -2474,9 +4214,9 @@ async function pollPerf(){
     }
 
     // header sparklines
-    drawMini($('#kReadSpark'), [{data:histR,color:cssVar('--read'), fill:'rgba(74,163,255,.16)'}],null,28);
-    drawMini($('#kWriteSpark'),[{data:histW,color:cssVar('--write'),fill:'rgba(188,140,255,.16)'}],null,28);
-    drawMini($('#kIopsSpark'), [{data:histI,color:cssVar('--accent'),fill:'rgba(74,163,255,.16)'}],null,28);
+    drawMini($('#kReadSpark'), [{data:histR,color:cssVar('--read'), fill:TC.readFillHi}],null,28);
+    drawMini($('#kWriteSpark'),[{data:histW,color:cssVar('--write'),fill:TC.writeFillHi}],null,28);
+    drawMini($('#kIopsSpark'), [{data:histI,color:cssVar('--accent'),fill:TC.readFillHi}],null,28);
 
     // Derived workload character: average I/O size distinguishes sequential
     // (large) from random (small) traffic, and the read/write mix drives cache
@@ -2496,7 +4236,7 @@ async function pollPerf(){
     drawMini($('#kIoSizeSpark'),[{data:histRSz,color:cssVar('--read')},
                                  {data:histWSz,color:cssVar('--write')}],null,28);
     drawMini($('#kMixSpark'),[{data:histMix,color:cssVar('--muted'),
-      fill:'rgba(74,163,255,.30)', fillNeg:'rgba(188,140,255,.30)'}],100,28,MAXH,true);
+      fill:TC.accentFill, fillNeg:TC.writeFillHi}],100,28,MAXH,true);
     $('#nbJobs').textContent = (d.jobs&&d.jobs.length)?d.jobs.length:'';
     drawSpark();
     drawModal();   // keep an open zoom popup live
@@ -2511,13 +4251,17 @@ async function pollPerf(){
         ${bar(j.percent,'var(--accent)',fmtBytes(j.bytesProcessed)+' / '+fmtBytes(j.bytesTotal))}</div>`).join('');
     } else { $('#jobs').className='jobsempty'; $('#jobs').textContent='No active storage jobs.'; }
   }catch(e){
-    $('#conn').innerHTML='<span class="dot" style="background:var(--bad)"></span>disconnected';
+    // A render fault is NOT a connection fault. Saying "disconnected" here sent
+    // people hunting the network for a bug in this file.
+    setConn('servererr','Render error: '+(e&&e.message||e));
+    if(window.console) console.error('pollPerf render:', e);
   }
 }
 
 async function pollTopology(){
+  const d = await getJson('/api/topology');
+  if(!d) return;
   try{
-    const r=await fetch('/api/topology'); const d=await r.json();
     lastTopoAt=Date.now();
     topoReady = !(d.warming===true || !d.timestamp);
     if(d.diag) topoDiag=d.diag;
@@ -2549,12 +4293,12 @@ async function pollTopology(){
     const pr=d.pools.map(p=>`<tr data-ft="pool" data-fk="${p.name}" title="Click to filter to this pool">
       <td><b>${p.name}</b><div class="muted" style="font-size:11px">pool · ${(p.diskNumbers||[]).length} drives</div></td>
       <td>${bar(p.pctUsed,p.pctUsed>90?'var(--bad)':p.pctUsed>75?'var(--warn)':'var(--accent)',p.pctUsed+'%')}</td>
-      <td class="right mono">${fmtBytes(p.size)}</td><td>${healthDot(p.health)}</td></tr>`);
+      <td class="right mono">${fmtBytes(p.size)}</td><td>${statusCell(p.health,p.opStatus)}</td></tr>`);
     const vr=d.virtualDisks.map(v=>{ const used=v.size?Math.min(100,v.allocated/v.size*100):0;
       return `<tr data-ft="space" data-fk="${v.name}" title="Click to filter to this space">
       <td><b>${v.name}</b><div class="muted" style="font-size:11px">${v.resiliency||''} · ${v.provisioning||''}${v.writeCacheSize>0?' · WBC '+fmtBytes(v.writeCacheSize):''}</div></td>
       <td>${bar(used,'var(--muted)',fmtBytes(v.allocated)+' used')}</td>
-      <td class="right mono">${fmtBytes(v.size)}</td><td>${healthDot(v.health)}</td></tr>`; });
+      <td class="right mono">${fmtBytes(v.size)}</td><td>${statusCell(v.health,v.opStatus)}</td></tr>`; });
     $('#poolTbl tbody').innerHTML=(pr.concat(vr)).join('')||'<tr><td colspan="4" class="muted">No pools found.</td></tr>';
 
     // volumes
@@ -2582,7 +4326,7 @@ async function pollTopology(){
         return `<div data-ft="space" data-fk="${v.name}" title="Click to filter to this space" style="margin-bottom:18px;padding:4px">
           <div style="display:flex;justify-content:space-between;margin-bottom:6px">
             <span><b>${v.name}</b> <span class="muted">${v.resiliency||''} · ${v.provisioning||''}${v.writeCacheSize>0?' · WBC '+fmtBytes(v.writeCacheSize):''}</span></span>
-            <span class="mono muted">${fmtBytes(tot)} across ${v.tiers.length} tiers · ${healthDot(v.health)}</span></div>
+            <span class="mono muted">${fmtBytes(tot)} across ${v.tiers.length} tiers · ${statusCell(v.health,v.opStatus)}</span></div>
           <div class="stack">${seg}</div>
           <div style="margin-top:8px;font-size:12px">${legend}</div></div>`;
       }).join('');
@@ -2596,6 +4340,9 @@ async function pollTopology(){
 
     lastTopoData=d;
     applyTopoDerived(d);
+    renderTriage(d, lastPerfData);
+    renderTimeline(d);
+    renderBayMap(d);
 
     // tiers
     $('#tiers').innerHTML=d.tiers.length? d.tiers.map(t=>`<div style="display:flex;justify-content:space-between;padding:3px 0">
@@ -2603,11 +4350,27 @@ async function pollTopology(){
       : '<span class="muted">No storage tiers configured.</span>';
 
     markActive();   // re-apply highlight after these tables were rebuilt
-  }catch(e){ /* keep last-good */ }
+  }catch(e){
+    // Keep last-good on screen, but SAY SO. "Keep last-good" rendered silently
+    // is the difference between stale data and current data being invisible —
+    // which during triage is the dashboard lying with a straight face.
+    setConn('servererr','Topology render error (showing last good data): '+(e&&e.message||e));
+    if(window.console) console.error('pollTopology render:', e);
+  }
 }
 
 // Realtime loop is self-scheduling (setTimeout after each response completes)
 // so requests never pile up if one is briefly slow — critical at ~100ms.
+initTheme();      // before the first paint, so canvases bake the right colours
+// History first: it is the one feed that can fill a chart before any live data
+// has arrived, which is the entire reason it exists.
+pollHistory();
+setInterval(pollHistory, 60000);
+loadBays();      // decides whether the bay editor is writable before it renders
+loadAlerts();    // severity overrides must be known before triage first renders
+// 1Hz is enough to make a stalled feed obvious without adding render churn at
+// the 100ms cadence — and it only touches the DOM when something is actually late.
+setInterval(stampPanelAges, 1000);
 initNav();
 initTempToggle();
 initPanelClose();
@@ -2643,9 +4406,41 @@ window.addEventListener('resize', drawSpark);
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
+# Every write endpoint in this dashboard is loopback-only, and every one of them
+# was repeating the same three steps: check IsLocal, read the body as UTF-8,
+# parse it. Three copies of a security check is three chances to omit one.
+#
+# Returns the parsed body, or $null having already sent the error response — so
+# a caller that forgets to check gets nothing rather than an unguarded object.
+function Read-LocalJsonPost {
+    param($Context, [string]$What = 'This')
+    if ($Context.Request.HttpMethod -ne 'POST') {
+        Send-Text $Context '{"error":"POST only"}' 'application/json' 405; return $null
+    }
+    if (-not $Context.Request.IsLocal) {
+        Send-Text $Context ("{`"error`":`"$What can only be changed from the machine itself (loopback).`"}") 'application/json' 403
+        return $null
+    }
+    try {
+        # ALWAYS UTF-8: HttpListener falls back to the system codepage when a
+        # request carries no charset, and browsers send none for JSON.
+        $reader = New-Object System.IO.StreamReader($Context.Request.InputStream, [System.Text.Encoding]::UTF8)
+        $raw = $reader.ReadToEnd(); $reader.Close()
+        return ($raw | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        Send-Text $Context ("{`"error`":`"$($_.Exception.Message -replace '"','\"')`"}") 'application/json' 400
+        return $null
+    }
+}
+
 function Send-Text {
     param($Context, [string]$Body, [string]$ContentType = 'text/html; charset=utf-8', [int]$Status = 200)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    # The body is ALWAYS UTF-8, so always say so. Declaring a bare
+    # 'application/json' left the charset to the client's default, which is the
+    # mirror image of the request-side mojibake bug and would bite the first
+    # time a bay label contained anything outside ASCII.
+    if ($ContentType -notmatch 'charset=') { $ContentType = "$ContentType; charset=utf-8" }
     $Context.Response.StatusCode  = $Status
     $Context.Response.ContentType = $ContentType
     $Context.Response.Headers['Cache-Control'] = 'no-store'
@@ -2675,9 +4470,37 @@ try {
 
 # Spin up the background collectors, each in its own runspace. The HTTP loop
 # below never blocks on storage because these threads own every slow call.
+# Injected into every collector runspace. Collectors run in FRESH runspaces, so
+# a function defined out here is not visible to them — prepending the text is
+# how they get to share code at all.
+#
+# This block was copy-pasted at the tail of all six collectors. It is also the
+# shutdown path: every copy is a place to get Ctrl+C wrong, and we already lost
+# an evening to a drain loop that forgot to check the stop flag.
+#
+# It is added to the runspace's INITIAL SESSION STATE, not prepended to the
+# script text. Prepending looked simpler and silently broke all six collectors:
+# $Script.ToString() returns a scriptblock's body WITHOUT its braces, so the
+# concatenation put a function definition ahead of `param(...)` — and param must
+# be the first statement in a script. The collectors kept running and simply
+# never received their arguments.
+$WaitIntervalBody = @'
+    param($Shared, [int]$Ms)
+    # Chunked so the stop flag is seen within ~100ms even on a 5-minute cadence.
+    $left = $Ms
+    while ($left -gt 0 -and -not $Shared['stop']) {
+        $chunk = [math]::Min(100, $left)
+        Start-Sleep -Milliseconds $chunk
+        $left -= $chunk
+    }
+'@
+
 function Start-Worker {
     param([scriptblock]$Script, [object[]]$Arguments)
-    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.Commands.Add(
+        (New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry 'Wait-Interval', $WaitIntervalBody))
+    $rs = [runspacefactory]::CreateRunspace($iss); $rs.Open()
     $ps = [powershell]::Create(); $ps.Runspace = $rs
     $null = $ps.AddScript($Script)
     foreach ($a in $Arguments) { $null = $ps.AddArgument($a) }
@@ -2703,6 +4526,98 @@ try {
     [Console]::add_CancelKeyPress($script:CancelHandler)
 } catch { }
 
+# Drains the collector log queue to the console.
+#
+# This used to be an inline `while ($Shared['log'].Count -gt 0) { Write-Host }`
+# with no bound and no stop check. On a HEALTHY system the queue is empty almost
+# every pass, so it was invisible. On a DEGRADED pool the storage collector logs
+# on every failed query, and a worker can enqueue faster than the console can
+# render — at which point that loop never exits, the outer loop never re-checks
+# $Shared['stop'], and Ctrl+C appears to do nothing.
+#
+# Bounded per pass, and it checks the stop flag itself. A tool whose job is
+# degraded arrays must not become unkillable when an array degrades.
+function Write-DrainLog {
+    param([int]$Max = 200)
+    $n = 0
+    while ($script:Shared['log'].Count -gt 0 -and $n -lt $Max -and -not $script:Shared['stop']) {
+        Write-Host ("  [{0:HH:mm:ss}] {1}" -f (Get-Date), $script:Shared['log'].Dequeue()) -ForegroundColor DarkYellow
+        $n++
+    }
+    if ($script:Shared['log'].Count -gt 0 -and -not $script:Shared['stop']) {
+        Write-Host ("  [{0:HH:mm:ss}] ... {1} more diagnostic line(s) queued" -f (Get-Date), $script:Shared['log'].Count) -ForegroundColor DarkGray
+    }
+}
+
+# Register the event-log source once. Creating a source needs elevation, so this
+# is best-effort: if it fails the dashboard carries on and simply doesn't mirror.
+# Checked here rather than in the worker because New-EventLog is slow and the
+# collector runs every 5s.
+if (-not $NoEventLog) {
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists('StorageSpacesDashboard')) {
+            New-EventLog -LogName Application -Source 'StorageSpacesDashboard' -ErrorAction Stop
+            Write-Host "  Registered event log source 'StorageSpacesDashboard' (Application log)." -ForegroundColor DarkGray
+        }
+        $script:Shared['evtLog'] = $true
+    } catch {
+        # SourceExists() THROWS when unelevated ("Inaccessible logs: Security")
+        # rather than returning false, so the raw message is about searching
+        # logs and reads like a much scarier problem than "not an admin".
+        $why = if ($_.Exception.Message -match 'Inaccessible logs|Security') { 'needs elevation' }
+               else { $_.Exception.Message.Trim() }
+        Write-Host "  Event log mirroring off ($why). Everything else works." -ForegroundColor DarkGray
+    }
+}
+
+# ---- bay map persistence ----------------------------------------------------
+# Sits next to the script. Plain JSON so you can edit it in Notepad, keep it in
+# source control, or copy it to the next machine. Absent is normal, not an error.
+$script:BaysPath = Join-Path (Split-Path -Parent $PSCommandPath) 'bays.json'
+# ---------------------------------------------------------------------------
+# Flat string->string maps persisted as JSON beside the script. Two of these now
+# exist (bay labels, alert overrides) and they had byte-identical load/save
+# logic. One implementation, two call sites.
+#
+# Deliberately NOT a general config system: these are the only two things this
+# tool keeps on disk, both of them human judgements that must survive a restart.
+# ---------------------------------------------------------------------------
+function Import-JsonMap {
+    param([string]$Path, [string]$Key, [string]$Label)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        $obj = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $h = @{}
+        foreach ($p in $obj.PSObject.Properties) { if ("$($p.Value)".Trim()) { $h["$($p.Name)"] = "$($p.Value)".Trim() } }
+        $script:Shared[$Key] = $h
+        Write-Host "  ${Label}: $($h.Count) entr$(if($h.Count -eq 1){'y'}else{'ies'}) from $Path" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  ${Label}: could not read $Path — $($_.Exception.Message.Trim())" -ForegroundColor Yellow
+    }
+}
+function Export-JsonMap {
+    param([string]$Path, [string]$Key)
+    try {
+        $h = $script:Shared[$Key]
+        ($h.GetEnumerator() | Sort-Object Name | ForEach-Object -Begin { $o=[ordered]@{} } `
+            -Process { $o[$_.Key] = $_.Value } -End { [pscustomobject]$o }) |
+            ConvertTo-Json -Depth 3 |
+            Set-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
+        return $true
+    } catch {
+        $script:Shared['log'].Enqueue("${Key}: save failed - $($_.Exception.Message)")
+        return $false
+    }
+}
+function Import-Bays  { Import-JsonMap -Path $script:BaysPath   -Key 'bays'   -Label 'Bay map' }
+function Export-Bays  { Export-JsonMap -Path $script:BaysPath   -Key 'bays' }
+$script:AlertsPath = Join-Path (Split-Path -Parent $PSCommandPath) 'alerts.json'
+function Import-Alerts { Import-JsonMap -Path $script:AlertsPath -Key 'alerts' -Label 'Alert rules' }
+function Export-Alerts { Export-JsonMap -Path $script:AlertsPath -Key 'alerts' }
+
+Import-Bays
+Import-Alerts
+
 $url = "http://localhost:$Port/"
 Write-Host "`n  Storage Spaces Dashboard is live:" -ForegroundColor Green
 Write-Host "    $url" -ForegroundColor Cyan
@@ -2721,15 +4636,10 @@ try {
         # every 200ms, so Ctrl+C is acted on promptly.
         $task = $listener.GetContextAsync()
         while (-not $task.AsyncWaitHandle.WaitOne(200)) {
-            # print anything the background collectors queued
-            while ($script:Shared['log'].Count -gt 0) {
-                Write-Host ("  [{0:HH:mm:ss}] {1}" -f (Get-Date), $script:Shared['log'].Dequeue()) -ForegroundColor DarkYellow
-            }
+            Write-DrainLog
             if ($script:Shared['stop'] -or -not $listener.IsListening) { break }
         }
-        while ($script:Shared['log'].Count -gt 0) {
-            Write-Host ("  [{0:HH:mm:ss}] {1}" -f (Get-Date), $script:Shared['log'].Dequeue()) -ForegroundColor DarkYellow
-        }
+        Write-DrainLog
         if (-not $task.IsCompleted) { continue }   # shutting down
         try { $ctx = $task.GetAwaiter().GetResult() } catch { continue }
         try {
@@ -2754,6 +4664,210 @@ try {
                     $j = $script:Shared['systemJson']
                     if (-not $j) { $j = '{}' }
                     Send-Text $ctx $j 'application/json'
+                }
+                '/api/history'   {
+                    # Built on demand rather than cached: it's requested every
+                    # few seconds, not 10x a second, and serialising ~900 points
+                    # per series is far cheaper than keeping a second copy of it
+                    # in sync with the writer.
+                    $h = $script:Shared['hist']
+                    $drv = @{}
+                    foreach ($k in @($h['d'].Keys)) {
+                        $drv[$k] = [pscustomobject]@{
+                            busy = @($h['d'][$k]['busy']); r = @($h['d'][$k]['r']); w = @($h['d'][$k]['w'])
+                        }
+                    }
+                    $cap = @{}
+                    foreach ($k in @($script:Shared['capHist'].Keys)) { $cap[$k] = @($script:Shared['capHist'][$k]) }
+                    $body = [pscustomobject]@{
+                        sampleMs = 1000
+                        t        = @($h['t'])
+                        totals   = [pscustomobject]@{ r=@($h['r']); w=@($h['w']); i=@($h['i']) }
+                        drives   = [pscustomobject]$drv
+                        capacity = [pscustomobject]$cap
+                    } | ConvertTo-Json -Depth 6 -Compress
+                    Send-Text $ctx $body 'application/json'
+                }
+                '/api/bundle'    {
+                    # Everything the dashboard knows, in one file: current
+                    # topology, the event timeline, the 15-minute history ring,
+                    # capacity trend, and the collector diagnostics. For the
+                    # forum post, the ticket, or just remembering what December
+                    # looked like.
+                    #
+                    # Assembled from the already-serialised feeds rather than by
+                    # re-querying storage — this must never be the request that
+                    # makes a struggling array worse.
+                    $h = $script:Shared['hist']
+                    $drv = @{}
+                    foreach ($k in @($h['d'].Keys)) {
+                        $drv[$k] = [pscustomobject]@{ busy=@($h['d'][$k]['busy']); r=@($h['d'][$k]['r']); w=@($h['d'][$k]['w']) }
+                    }
+                    $cap = @{}
+                    foreach ($k in @($script:Shared['capHist'].Keys)) { $cap[$k] = @($script:Shared['capHist'][$k]) }
+                    $stamp = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
+                    # try/catch is a STATEMENT in PS 5.1, not an expression, so it
+                    # cannot sit inside a hashtable literal. Hoisted.
+                    $bTopo = $null; $bPerf = $null; $bSys = $null; $bOs = $null
+                    try { if ($script:Shared['topoJson'])   { $bTopo = $script:Shared['topoJson']   | ConvertFrom-Json } } catch {}
+                    try { if ($script:Shared['perfJson'])   { $bPerf = $script:Shared['perfJson']   | ConvertFrom-Json } } catch {}
+                    try { if ($script:Shared['systemJson']) { $bSys  = $script:Shared['systemJson'] | ConvertFrom-Json } } catch {}
+                    try { $bOs = "$((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption)" } catch { $bOs = 'unknown' }
+                    $body = [pscustomobject]@{
+                        generated   = (Get-Date).ToString('o')
+                        host        = $script:HostName
+                        elevated    = [bool]$script:IsElevated
+                        dashboard   = [pscustomobject]@{
+                            port = $Port; sampleMs = $SampleMs; topologyMs = $TopologyMs
+                            systemMs = $SystemMs; jobsMs = $JobsMs; wearMs = $WearMs; layoutMs = $LayoutMs
+                            bindAll = [bool]$BindAll; exactLayout = [bool]$ExactLayout
+                        }
+                        os          = [pscustomobject]@{
+                            caption   = $bOs
+                            version   = "$([System.Environment]::OSVersion.Version)"
+                            psVersion = "$($PSVersionTable.PSVersion)"
+                        }
+                        topology    = $bTopo
+                        realtime    = $bPerf
+                        system      = $bSys
+                        events      = @($script:Shared['events'])
+                        history     = [pscustomobject]@{
+                            sampleMs = 1000; t = @($h['t'])
+                            totals = [pscustomobject]@{ r=@($h['r']); w=@($h['w']); i=@($h['i']) }
+                            drives = [pscustomobject]$drv
+                        }
+                        capacity    = [pscustomobject]$cap
+                        wearProgress= $script:Shared['wearProgress']
+                    } | ConvertTo-Json -Depth 8
+                    $ctx.Response.Headers['Content-Disposition'] =
+                        "attachment; filename=""storage-bundle_$($script:HostName)_$stamp.json"""
+                    Send-Text $ctx $body 'application/json'
+                }
+                '/api/bays'      {
+                    if ($ctx.Request.HttpMethod -eq 'POST') {
+                        # The only write endpoint in the whole dashboard, so it
+                        # gets the rule we settled on for auth: LOOPBACK ONLY.
+                        # If you are at the console you have already proven more
+                        # than a password could; if you are not, you cannot
+                        # relabel someone's drive bays. There is deliberately no
+                        # override switch for this.
+                        $in = Read-LocalJsonPost $ctx 'Bay labels'
+                        if ($null -eq $in) { break }
+                        try {
+                            $key = "$($in.key)".Trim()
+                            $lbl = "$($in.bay)".Trim()
+                            if (-not $key) { throw "missing key" }
+                            $h = $script:Shared['bays']
+                            # An empty label CLEARS the entry rather than storing
+                            # a blank one — otherwise bays.json slowly fills with
+                            # empty strings that look like real answers.
+                            if ($lbl) { $h[$key] = $lbl } elseif ($h.ContainsKey($key)) { $h.Remove($key) }
+                            $script:Shared['bays'] = $h
+                            $ok = Export-Bays
+                            Send-Text $ctx ("{`"ok`":$($ok.ToString().ToLower()),`"count`":$($h.Count)}") 'application/json'
+                        } catch {
+                            Send-Text $ctx ("{`"error`":`"$($_.Exception.Message -replace '"','\"')`"}") 'application/json' 400
+                        }
+                    } else {
+                        $h = $script:Shared['bays']
+                        $o = [ordered]@{}
+                        foreach ($k in ($h.Keys | Sort-Object)) { $o[$k] = $h[$k] }
+                        Send-Text $ctx ([pscustomobject]@{
+                            editable = [bool]$ctx.Request.IsLocal
+                            path     = "$script:BaysPath"
+                            bays     = [pscustomobject]$o
+                        } | ConvertTo-Json -Depth 3) 'application/json'
+                    }
+                }
+                '/api/alerts'    {
+                    if ($ctx.Request.HttpMethod -eq 'POST') {
+                        $in = Read-LocalJsonPost $ctx 'Alert rules'
+                        if ($null -eq $in) { break }
+                        try {
+                            $key = "$($in.key)".Trim()
+                            $lvl = "$($in.level)".Trim().ToLower()
+                            if (-not $key) { throw 'missing key' }
+                            if ($lvl -and $lvl -notin @('hidden','info','warn')) { throw "level must be hidden, info or warn" }
+                            $h = $script:Shared['alerts']
+                            # Empty level RESTORES the finding to its natural severity.
+                            if ($lvl) { $h[$key] = $lvl } elseif ($h.ContainsKey($key)) { $h.Remove($key) }
+                            $script:Shared['alerts'] = $h
+                            $ok = Export-Alerts
+                            Send-Text $ctx ("{`"ok`":$($ok.ToString().ToLower()),`"count`":$($h.Count)}") 'application/json'
+                        } catch {
+                            Send-Text $ctx ("{`"error`":`"$($_.Exception.Message -replace '"','\"')`"}") 'application/json' 400
+                        }
+                    } else {
+                        $h = $script:Shared['alerts']
+                        $o = [ordered]@{}
+                        foreach ($k in ($h.Keys | Sort-Object)) { $o[$k] = $h[$k] }
+                        Send-Text $ctx ([pscustomobject]@{
+                            editable = [bool]$ctx.Request.IsLocal
+                            path     = "$script:AlertsPath"
+                            rules    = [pscustomobject]$o
+                        } | ConvertTo-Json -Depth 3) 'application/json'
+                    }
+                }
+                '/api/identify'  {
+                    # Blink the drive's identify LED — the real answer to "which
+                    # drawer", better than any map because the hardware points at
+                    # itself. Needs an enclosure that speaks SES; most direct-
+                    # attach consumer kit does not, and when it doesn't we say so
+                    # plainly rather than returning success and blinking nothing.
+                    $in = Read-LocalJsonPost $ctx 'Identify'
+                    if ($null -eq $in) { break }
+                    try {
+                        $uid = "$($in.uniqueId)".Trim()
+                        $secs = if ($in.seconds) { [int]$in.seconds } else { 30 }
+                        if ($secs -lt 1)   { $secs = 1 }
+                        if ($secs -gt 300) { $secs = 300 }
+                        if (-not $uid) { throw 'missing uniqueId' }
+
+                        $pdisk = Get-PhysicalDisk -UniqueId $uid -ErrorAction Stop
+                        $off   = [bool]$in.off
+
+                        if ($off) {
+                            try   { Disable-PhysicalDiskIndication    -InputObject $pdisk -ErrorAction Stop }
+                            catch { Disable-PhysicalDiskIdentification -InputObject $pdisk -ErrorAction Stop }
+                            $script:Shared['identify'] = $null
+                            Send-Text $ctx '{"ok":true,"state":"off"}' 'application/json'
+                        } else {
+                            # Cmdlet name differs by Windows version: Indication on
+                            # 2012 R2-era builds, Identification on current ones.
+                            $err = $null
+                            try   { Enable-PhysicalDiskIndication    -InputObject $pdisk -ErrorAction Stop }
+                            catch {
+                                $err = $_.Exception.Message
+                                try   { Enable-PhysicalDiskIdentification -InputObject $pdisk -ErrorAction Stop; $err = $null }
+                                catch { $err = $_.Exception.Message }
+                            }
+                            if ($err) {
+                                # Do NOT just assume "no SES enclosure". The first
+                                # version said exactly that and was wrong: on an
+                                # unelevated dashboard the cmdlet returns "Access
+                                # denied", which is a completely different problem
+                                # with a completely different fix. Read the error
+                                # before naming the cause.
+                                $why = if ($err -match 'access is denied|access denied|privilege') {
+                                    'Identify needs an ELEVATED dashboard. Restart it as Administrator.'
+                                } elseif ($err -match 'not supported|not implemented|invalid') {
+                                    'This drive/enclosure does not support identify LEDs (needs SCSI Enclosure Services).'
+                                } else {
+                                    'Could not switch the identify LED on.'
+                                }
+                                Send-Text $ctx ([pscustomobject]@{
+                                    ok = $false; error = $why; detail = "$err"
+                                } | ConvertTo-Json) 'application/json' 501
+                            } else {
+                                $script:Shared['identify'] = [pscustomobject]@{
+                                    uniqueId = $uid; until = [datetime]::UtcNow.AddSeconds($secs)
+                                }
+                                Send-Text $ctx ("{`"ok`":true,`"state`":`"on`",`"seconds`":$secs}") 'application/json'
+                            }
+                        }
+                    } catch {
+                        Send-Text $ctx ("{`"ok`":false,`"error`":`"$($_.Exception.Message -replace '"','\"')`"}") 'application/json' 400
+                    }
                 }
                 '/favicon.ico'   { Send-Text $ctx '' 'image/x-icon' 204 }
                 default          { Send-Text $ctx 'Not found' 'text/plain' 404 }
