@@ -11,7 +11,7 @@ One self-contained PowerShell script. No modules to install, no runtime to deplo
 ![Overview](docs/overview.png)
 ![Triage](docs/triage.png)
 ![Drives](docs/drives.png)
-![Resiliency](docs/Resiliency.png)
+![Resiliency](docs/resiliency.png)
 
 ---
 
