@@ -67,6 +67,11 @@ This joins the two: **live per-drive I/O correlated with the Storage Spaces obje
 - SMART wear and temperature, with °C/°F toggle
 - Health rollup: drive counts by media, hottest drive, max wear, split I/O rate
 
+**Builds the commands, never runs them**
+- An **Actions** tab that composes Storage Spaces work — **create** a space, **expand** a pool, or **maintain** one — and emits the exact PowerShell to run. See [Actions](#actions--build-the-commands) below
+- Live geometry as you build: storage efficiency, fault tolerance, usable capacity, column count, and warnings when you don't have enough disks for the layout you picked
+- Nothing is ever executed against the storage stack. You review the commands and run them yourself
+
 **Interface**
 - Left navigation with **health indicators** — a failed drive is visible from any page
 - Every panel can be **closed, reordered by drag, and resized**; layout persists across reloads
@@ -114,7 +119,53 @@ New-NetFirewallRule -DisplayName "Storage Dashboard" -Direction Inbound -Protoco
 .\StorageSpacesDashboard.ps1 -BindAll
 ```
 
-> ⚠️ **`-BindAll` has no authentication and no TLS.** It serves your full storage topology — pool names, drive serials, SMART wear, repair state — as plaintext HTTP to anyone who can reach the port. Only use it on a network you trust, or reach the default `localhost` bind over an SSH tunnel / VPN instead. The bay-map and alert-suppression *edits* are always restricted to the local console regardless, but everything is **readable** over `-BindAll`.
+Network access is protected by an access key — see below.
+
+### Access & authentication
+
+Designed around one rule that keeps it out of your way:
+
+> **Localhost never authenticates.** The console, an RDP session, and the
+> copy-this-file-to-a-broken-box-at-3am path are all trusted — you have already
+> proven more than a password could. Only requests arriving *over the network*
+> need the key.
+
+The key is generated on first run, printed to the console, and **persisted in
+`key.json`** — the same key every run, so bookmarks keep working. It is never
+regenerated behind your back.
+
+```
+  Access key (needed only from other machines):
+    H7RC7-NPG73-GE9DB-CXSVT
+```
+
+**One-click access from another machine.** The launch URL carries the key, so
+bookmark it once and you never see a login form:
+
+```
+http://your-server:8080/?k=H7RC7-NPG73-GE9DB-CXSVT
+```
+
+Opening it sets a **ten-year `HttpOnly` cookie** and redirects to a clean URL, so
+the key doesn't linger in the address bar. Every later visit from that browser
+just works. A browser without the cookie gets a login page instead — it shows the
+hostname, uptime and collector count (liveness, *never* health, so an
+unauthenticated page can't reveal whether your array is in trouble) and takes the
+key once.
+
+| | |
+|---|---|
+| `-SetKey <value>` | use a specific key (e.g. to give several machines the same one) |
+| `-NewKey` | rotate to a fresh key — invalidates existing bookmarks and cookies |
+
+Bay-map edits, alert suppression and the drive-identify LED are restricted to the
+**local console** regardless of the key.
+
+> ⚠️ **No TLS.** The key and your topology cross the network in the clear. This is
+> a deliberate trade for a trusted LAN: it stops opportunistic scanners and
+> anything that reaches the port without knowing you, but it will not stop someone
+> who can watch the wire. Don't expose it to an untrusted network — put it behind
+> a VPN or an SSH tunnel instead.
 
 ### Parameters
 
@@ -133,6 +184,11 @@ New-NetFirewallRule -DisplayName "Storage Dashboard" -Direction Inbound -Protoco
 | `-IncludeWear` | on | Gather SMART wear/temperature |
 | `-ExactLayout` | off | Attempt exact per-slab placement (see [Limitations](#limitations)) |
 | `-NoEventLog` | off | Don't mirror state changes to the Windows event log |
+| `-SetKey <value>` | — | Set the network access key to a specific value, then run |
+| `-NewKey` | off | Rotate to a fresh random access key, then run |
+| `-Install` | — | Register as a boot-start daemon, then exit *(elevated)* |
+| `-Uninstall` | — | Remove that registration, then exit *(elevated)* |
+| `-DaemonStatus` | — | Report whether the daemon is installed and running, then exit |
 
 Lower cadences cost more CPU. Counter reads are cheap (~20 ms for 300 counters), but each cadence also drives JSON serialisation and browser rendering.
 
@@ -160,14 +216,56 @@ desktop at boot). The key is **not** regenerated on each boot: it persists in
 
 ### Files it writes
 
-The script is the only thing you deploy. At runtime it may create two small files **next to itself**, both optional — absent means the feature is simply inactive:
+The script is the only thing you deploy. At runtime it may create three small files **next to itself**, all optional — absent means the feature is simply inactive:
 
 | File | Written when | Editable |
 |---|---|---|
+| `key.json` | first run — holds the network access key | delete to force a new key |
 | `bays.json` | you label a drive bay | from the console only (loopback) |
 | `alerts.json` | you suppress or downgrade a triage finding | from the console only (loopback) |
 
 They're generated, never deployed. Delete them to reset that state.
+
+## Actions — build the commands
+
+The **Actions** tab is a composer. You describe what you want, it shows you the
+consequences, and it writes the exact command sequence. **It never runs anything**
+— the dashboard reads the storage stack and does not mutate it, which is the same
+contract the triage remedies follow. You copy the commands into an elevated
+prompt and stay in control of what actually touches your pool.
+
+**Create** — pick a layout and see the arithmetic before you commit:
+
+| | |
+|---|---|
+| Layout | single space, or **tiered** (an SSD tier + an HDD tier, each with its own resiliency) |
+| Resiliency | Simple · two-way / three-way mirror · single / dual parity |
+| Also | write-back cache size, thin vs fixed, column count, ReFS/NTFS, drive letter |
+
+As you change anything it recomputes storage efficiency, fault tolerance, raw and
+usable capacity, and column geometry — and warns when your disk count can't
+support the layout (*"Three-way mirror needs at least 5 disks; you have 3"*). So a
+mixed configuration — a mirrored SSD tier in front of a dual-parity HDD tier with
+a 20 GB write-back cache — is a few clicks, and you can see what it costs you
+before you build it.
+
+**Expand** — add every currently poolable disk to an existing pool
+(`Add-PhysicalDisk`), optionally rebalance existing data onto them
+(`Optimize-StoragePool`), with the follow-on commands to grow a thin space and its
+partition into the new capacity.
+
+**Maintain** — on-demand operations against a pool or space:
+
+- **Repair** a degraded or incomplete space (`Repair-VirtualDisk`)
+- **Run the ReFS Data Integrity Scan now** rather than waiting ~4 weeks
+- **Rebalance** a pool
+- **Enable ReFS integrity streams**, so file *data* is checksummed and silent corruption can actually be detected
+- **Retire a failed disk** so its data is rebuilt elsewhere, then repair
+
+The resiliency figures are for **standalone** Storage Spaces (a fault domain is
+one disk), not Storage Spaces Direct. They're guidance for getting the command
+right — Storage Spaces itself is the final authority and will reject a layout it
+can't build.
 
 ## Architecture
 
