@@ -8,9 +8,11 @@ One self-contained PowerShell script. No modules to install, no runtime to deplo
 .\StorageSpacesDashboard.ps1
 ```
 
-![Overview](docs/Overview.png)
+![Overview](docs/overview.png)
+![Triage](docs/triage.png)
+![Drives](docs/drives.png)
 ![Resiliency](docs/Resiliency.png)
-![Drives](docs/Drives.png)
+
 ---
 
 ## Why
@@ -20,6 +22,25 @@ Windows exposes a great deal about Storage Spaces, but it's scattered across `Ge
 This joins the two: **live per-drive I/O correlated with the Storage Spaces objects those drives belong to.**
 
 ## Features
+
+**Triage first**
+- A **Triage** view that is *computed, not curated* — it ranks everything wrong across drives, pools, spaces and jobs, worst first, and it only appears in the nav when there is something to say
+- **Actionable** — every finding shows the fix: a copyable PowerShell command (`Repair-VirtualDisk`, `Set-StoragePool -IsReadOnly $false`, …) and a link to the exact Microsoft docs page. Commands are copy-only; the dashboard reads the storage stack, it never repairs it
+- **What happened**: a server-side timeline of state transitions. During an incident *ordering is causality*, and this survives the page reload you do when something breaks
+- **Last 15 minutes**: throughput history recorded on the server since the process started, so opening the dashboard mid-incident gives you a past instead of a blank chart
+- **Physical bay map**: which drawer to open. Keyed on the serial number printed on the drive itself, so it survives reboots, re-cabling and moving ports. **Blink** a drive's identify LED to have the hardware point at itself (needs an SES enclosure)
+- **Suppress the noise you understand** — mark a finding *not critical* or hide it, per machine. Suppressed findings are never silently dropped: a count is always shown, one click brings them back
+- State changes mirrored to the **Windows event log**, so whatever you already run picks them up
+- **One-click diagnostic bundle** — topology, timeline, 15-minute history, capacity trend and collector diagnostics as a single JSON file, for the forum post or the ticket
+
+**Tells you *why*, not just *what***
+- `OperationalStatus` for drives, pools and virtual disks — *Lost Communication*, *Predictive Failure*, *Degraded*, *Incomplete*, *No redundancy* — the field that names the failure
+- **Reason codes**: a pool that is read-only because it *lost quorum* is a catastrophe; one an administrator set is a Tuesday. `ReadOnlyReason`, `DetachedReason` and `CannotPoolReason` are shown with what they mean
+- **Peer-relative latency**: a drive several times slower than its own mirror partners is failing, and Windows will call it `Healthy` the whole time
+- **Temperature against each drive's own rated maximum**, not a number someone picked
+- **SMART's own failure prediction**, which is a different signal from Storage Spaces' — the drive firmware raises it and Spaces does not always surface it
+- **ReFS data integrity**: whether the Data Integrity Scan has run, and any corruption ReFS logged
+- **Capacity forecast**: days-to-full from the allocation trend, which refuses to answer rather than extrapolate from noise
 
 **Realtime I/O — 100 ms**
 - Per-drive **% busy, IOPS, read/write MB/s, queue depth, and read/write latency**
@@ -51,6 +72,9 @@ This joins the two: **live per-drive I/O correlated with the Storage Spaces obje
 - Left navigation with **health indicators** — a failed drive is visible from any page
 - Every panel can be **closed, reordered by drag, and resized**; layout persists across reloads
 - Click a pool or space to **filter** the whole dashboard to its drives
+- **Per-panel staleness** — if a collector stalls, the panels it feeds say how old their data is, on the panel, not just in the header. A monitoring tool must never render stale data with a confident face
+- **Light / dark / auto** theme, following the OS by default
+- **Keyboard-operable** — every control is reachable by tab and arrow keys, for driving it over laggy RDP; WCAG AA contrast in both themes, and animation respects `prefers-reduced-motion`
 - Machine name in the header and tab title, for telling servers apart
 
 ## Requirements
@@ -91,6 +115,8 @@ New-NetFirewallRule -DisplayName "Storage Dashboard" -Direction Inbound -Protoco
 .\StorageSpacesDashboard.ps1 -BindAll
 ```
 
+> ⚠️ **`-BindAll` has no authentication and no TLS.** It serves your full storage topology — pool names, drive serials, SMART wear, repair state — as plaintext HTTP to anyone who can reach the port. Only use it on a network you trust, or reach the default `localhost` bind over an SSH tunnel / VPN instead. The bay-map and alert-suppression *edits* are always restricted to the local console regardless, but everything is **readable** over `-BindAll`.
+
 ### Parameters
 
 | Parameter | Default | Purpose |
@@ -107,8 +133,20 @@ New-NetFirewallRule -DisplayName "Storage Dashboard" -Direction Inbound -Protoco
 | `-LayoutMs` | `300000` | Tier/drive layout |
 | `-IncludeWear` | on | Gather SMART wear/temperature |
 | `-ExactLayout` | off | Attempt exact per-slab placement (see [Limitations](#limitations)) |
+| `-NoEventLog` | off | Don't mirror state changes to the Windows event log |
 
 Lower cadences cost more CPU. Counter reads are cheap (~20 ms for 300 counters), but each cadence also drives JSON serialisation and browser rendering.
+
+### Files it writes
+
+The script is the only thing you deploy. At runtime it may create two small files **next to itself**, both optional — absent means the feature is simply inactive:
+
+| File | Written when | Editable |
+|---|---|---|
+| `bays.json` | you label a drive bay | from the console only (loopback) |
+| `alerts.json` | you suppress or downgrade a triage finding | from the console only (loopback) |
+
+They're generated, never deployed. Delete them to reset that state.
 
 ## Architecture
 
@@ -116,12 +154,14 @@ The HTTP handler never touches the storage stack. Every collector runs on its ow
 
 | Collector | Cadence | Reads |
 |---|---|---|
-| Perf | 100 ms | `PhysicalDisk` performance counters only |
+| Perf | 100 ms | `PhysicalDisk` performance counters; also maintains the 1 Hz throughput history ring |
 | System | 250 ms | CPU, memory, Storage Spaces write cache / tier / vdisk counters |
 | Jobs | 5 s | `Get-StorageJob` |
-| Topology | 5 s | Pools, virtual disks, tiers, volumes, physical disks |
-| Wear | 5 min | `Get-StorageReliabilityCounter` (SMART) |
+| Topology | 5 s | Pools, virtual disks, tiers, volumes, physical disks (with reason codes); diffs state into the event timeline, samples the capacity trend, and (≤5 min) checks ReFS integrity + the Data Integrity Scan |
+| Wear | 5 min | `Get-StorageReliabilityCounter` (SMART wear/temp + rated max), plus SMART failure prediction (`MSStorageDriver_FailurePredictStatus`) |
 | Layout | 5 min | Tier → drive membership |
+
+All of that history — the throughput ring, the event timeline, the capacity trend — lives **in memory** and dies with the process. No database, no schema, no retention policy, nothing that could itself be the broken thing.
 
 Design notes:
 
