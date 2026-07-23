@@ -12,7 +12,6 @@ One self-contained PowerShell script. No modules to install, no runtime to deplo
 ![Triage](docs/triage.png)
 ![Drives](docs/drives.png)
 ![Resiliency](docs/resiliency.png)
-
 ---
 
 ## Why
@@ -136,6 +135,28 @@ New-NetFirewallRule -DisplayName "Storage Dashboard" -Direction Inbound -Protoco
 | `-NoEventLog` | off | Don't mirror state changes to the Windows event log |
 
 Lower cadences cost more CPU. Counter reads are cheap (~20 ms for 300 counters), but each cadence also drives JSON serialisation and browser rendering.
+
+### Run it as a daemon (starts at boot)
+
+Optional. Registers a Scheduled Task that runs this same script at every boot, as
+SYSTEM, elevated, with no console and no login required — so the dashboard is up
+before you are. Deliberately a task and not a Windows service: a service needs a
+wrapper like NSSM, and an external dependency would break the one-file rule.
+
+```powershell
+# elevated
+.\StorageSpacesDashboard.ps1 -Install                 # boot-start, default options
+.\StorageSpacesDashboard.ps1 -Install -Port 9000 -BindAll   # options are baked in
+
+.\StorageSpacesDashboard.ps1 -DaemonStatus            # is it installed / running?
+.\StorageSpacesDashboard.ps1 -Uninstall               # elevated; stop starting at boot
+```
+
+`-Install` prints the access key before it registers anything — once it's running
+as SYSTEM there is no console to print it to. Whatever options you pass to
+`-Install` are baked into the boot command (`-NoLaunch` is forced; there's no
+desktop at boot). The key is **not** regenerated on each boot: it persists in
+`key.json`, so your bookmark keeps working.
 
 ### Files it writes
 
