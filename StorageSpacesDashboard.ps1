@@ -50,9 +50,15 @@ param(
     [int]    $JobsMs      = 5000,  # storage job polling (repair/rebalance progress)
     [int]    $WearMs      = 300000,# SMART wear/temp — expensive, changes glacially
     [int]    $LayoutMs    = 300000,# tier/drive layout — effectively static
-    [switch] $ExactLayout        # attempt exact per-slab placement via Get-PhysicalExtent.
+    [switch] $ExactLayout,       # attempt exact per-slab placement via Get-PhysicalExtent.
                                  # OFF by default: that cmdlet returns one row PER SLAB and
                                  # on a multi-TB pool it can run effectively forever.
+    [string] $SetKey,            # set the network access key to this value, then run
+    [switch] $NewKey,            # generate a fresh random access key, then run
+    # ---- run as a background daemon (a Scheduled Task, no extra software) ----
+    [switch] $Install,           # register to start at every boot, then exit
+    [switch] $Uninstall,         # remove that registration, then exit
+    [switch] $DaemonStatus       # report whether the daemon is installed/running
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +77,110 @@ try {
         [Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch {}
+
+# ---------------------------------------------------------------------------
+# Access key storage. Defined up here because the daemon installer below needs
+# to resolve (and show you) the key before it registers anything — once it runs
+# as a service there is no console to print it to.
+# ---------------------------------------------------------------------------
+$script:KeyPath = Join-Path (Split-Path -Parent $PSCommandPath) 'key.json'
+function New-AccessKey {
+    # 20 chars, unambiguous alphabet (no 0/O/1/I), grouped for readability.
+    $abc = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $b = New-Object byte[] 20; $rng.GetBytes($b); $rng.Dispose()
+    $s = -join ($b | ForEach-Object { $abc[$_ % $abc.Length] })
+    ($s.Substring(0,5)+'-'+$s.Substring(5,5)+'-'+$s.Substring(10,5)+'-'+$s.Substring(15,5))
+}
+function Save-AccessKey { param([string]$K)
+    try { [pscustomobject]@{ key = $K } | ConvertTo-Json | Set-Content -LiteralPath $script:KeyPath -Encoding UTF8 -ErrorAction Stop; $true }
+    catch { Write-Host "  Could not write $($script:KeyPath): $($_.Exception.Message.Trim())" -ForegroundColor Yellow; $false }
+}
+# Idempotent: the key is resolved once and PERSISTS across runs, so every launch
+# (and the daemon) uses the same one until you -NewKey or -SetKey.
+function Initialize-AccessKey {
+    if ($script:AccessKey) { return }
+    if     ($SetKey) { $script:AccessKey = $SetKey.Trim(); [void](Save-AccessKey $script:AccessKey) }
+    elseif ($NewKey) { $script:AccessKey = New-AccessKey;  [void](Save-AccessKey $script:AccessKey) }
+    elseif (Test-Path -LiteralPath $script:KeyPath) {
+        try { $script:AccessKey = "$(((Get-Content -LiteralPath $script:KeyPath -Raw) | ConvertFrom-Json).key)".Trim() } catch {}
+    }
+    if (-not $script:AccessKey) { $script:AccessKey = New-AccessKey; [void](Save-AccessKey $script:AccessKey) }
+}
+
+# ---------------------------------------------------------------------------
+# Daemonise: a Scheduled Task that runs this same script at boot, as SYSTEM,
+# elevated, with no console. Deliberately NOT a Windows service — that needs a
+# wrapper like NSSM, and an external dependency would break the one-file rule.
+# A task needs nothing that isn't already in Windows.
+#
+# These switches exit before any listener or collector starts.
+# ---------------------------------------------------------------------------
+$script:TaskName = 'StorageSpacesDashboard'
+if ($Install -or $Uninstall -or $DaemonStatus) {
+    if ($DaemonStatus) {
+        $t = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+        if (-not $t) { Write-Host "`n  Daemon not installed. Install with:  .\$(Split-Path -Leaf $PSCommandPath) -Install   (elevated)`n" -ForegroundColor DarkGray }
+        else {
+            $i = $t | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+            Write-Host "`n  Daemon '$($script:TaskName)'" -ForegroundColor Green
+            Write-Host "    state      : $($t.State)"
+            if ($i) {
+                Write-Host "    last run   : $(if($i.LastRunTime -and $i.LastRunTime.Year -ge 2000){$i.LastRunTime}else{'never'})"
+                Write-Host "    last result: $($i.LastTaskResult)  (0 = ok, 267009 = currently running)"
+            }
+            Write-Host "    command    : $($t.Actions[0].Execute) $($t.Actions[0].Arguments)" -ForegroundColor DarkGray
+            Write-Host ""
+        }
+        return
+    }
+    if (-not $script:IsElevated) { throw "Installing or removing the daemon needs an ELEVATED PowerShell (Run as Administrator)." }
+    if ($Uninstall) {
+        $t = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+        if (-not $t) { Write-Host "`n  Daemon was not installed. Nothing to do.`n" -ForegroundColor DarkGray; return }
+        try { Stop-ScheduledTask  -TaskName $script:TaskName -ErrorAction SilentlyContinue } catch {}
+        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false
+        Write-Host "`n  Daemon removed. The dashboard will no longer start at boot.`n" -ForegroundColor Green
+        return
+    }
+
+    # -Install. Resolve the key FIRST and show it: once this runs as SYSTEM there
+    # is no console, so this is the only chance to read it.
+    Initialize-AccessKey
+
+    # Re-pass whatever options this install was invoked with, so the daemon runs
+    # the same configuration. -NoLaunch is forced: there is no desktop at boot.
+    $pass = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'),'-NoLaunch')
+    foreach ($k in $PSBoundParameters.Keys) {
+        if ($k -in @('Install','Uninstall','DaemonStatus','NoLaunch','SetKey','NewKey')) { continue }
+        $v = $PSBoundParameters[$k]
+        if ($v -is [switch]) { if ($v.IsPresent) { $pass += "-$k" } }
+        else { $pass += "-$k"; $pass += "$v" }
+    }
+    $act  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($pass -join ' ')
+    $trg  = New-ScheduledTaskTrigger -AtStartup
+    $prin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    # ExecutionTimeLimit 0 = never kill it; restart a few times if it dies.
+    $set  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+              -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+              -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $script:TaskName -Action $act -Trigger $trg `
+        -Principal $prin -Settings $set -Force | Out-Null
+    try { Start-ScheduledTask -TaskName $script:TaskName } catch {}
+
+    Write-Host "`n  Daemon installed and started." -ForegroundColor Green
+    Write-Host "    Runs at every boot as SYSTEM, elevated, no login needed."
+    Write-Host "    Reach it at   http://localhost:$Port/" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Access key (needed only from OTHER machines):" -ForegroundColor Green
+    Write-Host "    $($script:AccessKey)" -ForegroundColor Yellow
+    if ($BindAll) { Write-Host "    bookmark:  http://$($script:HostName):$Port/?k=$($script:AccessKey)" -ForegroundColor Cyan }
+    Write-Host ""
+    Write-Host "    status:  .\$(Split-Path -Leaf $PSCommandPath) -DaemonStatus"
+    Write-Host "    remove:  .\$(Split-Path -Leaf $PSCommandPath) -Uninstall   (elevated)"
+    Write-Host ""
+    return
+}
 
 # Keep cadences sane. Very small intervals raise CPU (counter reads scale with
 # disk count x frequency) with diminishing visual benefit below ~50ms.
@@ -1517,6 +1627,37 @@ $HtmlPage = @'
   .blinkbtn.on{background:var(--accent);color:#04121f;border-color:var(--accent)}
   .blinkbtn.bad{color:var(--bad);border-color:var(--bad)}
   .blinkbtn:disabled{cursor:default}
+  /* ---- storage space composer ---- */
+  .createwrap{display:flex;gap:20px;flex-wrap:wrap}
+  .createform{flex:1 1 380px;min-width:320px;display:flex;flex-direction:column;gap:14px}
+  .createside{flex:1 1 300px;min-width:280px}
+  .crow{display:flex;flex-direction:column;gap:5px}
+  .crow>label{font-size:12px;color:var(--muted);font-weight:600}
+  .crow select,.crow input[type=text],.crow input[type=number]{background:var(--panel2);
+    border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 9px;
+    font-family:inherit;font-size:13px;width:100%}
+  .crow select:focus-visible,.crow input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .cseg{display:flex;flex-wrap:wrap;gap:6px}
+  .cseg button{background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+    border-radius:7px;padding:6px 11px;cursor:pointer;font-family:inherit;font-size:12.5px}
+  .cseg button.on{background:var(--hi);color:var(--hi-fg);border-color:var(--hi-br);font-weight:600}
+  .cinline{display:flex;gap:12px;flex-wrap:wrap}
+  .cinline .crow{flex:1 1 120px}
+  .ctoggle{display:flex;align-items:center;gap:9px;cursor:pointer;font-size:13px;user-select:none}
+  .ctoggle input{width:16px;height:16px;accent-color:var(--accent)}
+  .cstat{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--panel2);font-size:13px}
+  .cstat:last-child{border-bottom:none}
+  .cstat b{font-variant-numeric:tabular-nums}
+  .cstat .k{color:var(--muted)}
+  .cwarnitem{display:flex;gap:8px;align-items:flex-start;padding:7px 10px;margin-top:6px;border-radius:7px;
+    border-left:3px solid var(--warn);background:color-mix(in srgb,var(--warn) 8%,transparent);font-size:12.5px}
+  .cwarnitem.bad{border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,transparent)}
+  .cwarnitem.ok{border-left-color:var(--good);background:color-mix(in srgb,var(--good) 8%,transparent)}
+  /* Height is owned by the enclosing .pbody (resizable); the pre just fills it. */
+  .cmdblock{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px 14px;
+    font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.55;color:var(--text);
+    white-space:pre;overflow-x:auto;margin:0;min-height:100%}
+  .cmdblock .cm{color:var(--muted)}
   /* resizable + scrollable panel bodies (drag the bottom-right corner) */
   /* No native `resize`: its grip lives in the bottom-right corner, under the
      full-bleed canvas and clipped by overflow:hidden, so it was invisible. A
@@ -1690,6 +1831,7 @@ $HtmlPage = @'
   <g id="i-jobs"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3.3M12 18.2v3.3M2.5 12h3.3M18.2 12h3.3M5.2 5.2l2.4 2.4M16.4 16.4l2.4 2.4M18.8 5.2l-2.4 2.4M7.6 16.4l-2.4 2.4"/></g>
   <g id="i-restore"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1" stroke-linecap="round"/><path d="M3 3.5v5h5" stroke-linejoin="round"/></g>
   <g id="i-triage"><path d="M2.5 12.5h4l2.5-6 4 12 2.5-6h6" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g id="i-create"><rect x="3" y="3" width="18" height="18" rx="2.5"/><path d="M12 8v8M8 12h8" stroke-linecap="round"/></g>
 </defs></svg>
 
 <nav class="side" id="nav" aria-label="Sections">
@@ -1703,6 +1845,7 @@ $HtmlPage = @'
   <button type="button" class="navitem" data-group="capacity"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-capacity"/></svg>Capacity <span class="ndot" id="ndCap"></span><span class="nb" id="nbCap"></span></button>
   <button type="button" class="navitem" data-group="resiliency"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-resiliency"/></svg>Resiliency <span class="ndot" id="ndRes"></span></button>
   <button type="button" class="navitem" data-group="jobs"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-jobs"/></svg>Jobs <span class="nb" id="nbJobs"></span></button>
+  <button type="button" class="navitem" data-group="create"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-create"/></svg>Actions</button>
   <div class="navsec" id="restoreSec" style="display:none">Hidden panels</div>
   <button type="button" class="navitem" id="restorePanels" style="display:none" title="Show every hidden panel again"><svg class="nicon" viewBox="0 0 24 24"><use href="#i-restore"/></svg>Restore all <span class="nb" id="nbHidden"></span></button>
 </nav>
@@ -1811,7 +1954,7 @@ $HtmlPage = @'
   <div class="card sec" data-panel="bayMap">
     <h2>Physical bay map <span class="muted" style="text-transform:none;letter-spacing:0">· which drawer to open</span></h2>
     <div id="bayHint" class="status" style="margin-bottom:10px"></div>
-    <div style="overflow-x:auto"><table id="bayTbl">
+    <div class="pbody" data-pk="bays" style="height:300px"><table id="bayTbl">
       <thead><tr><th>Drive</th><th>Media</th><th style="width:34%">Bay / physical location</th>
         <th>Serial</th><th>Reported by hardware</th></tr></thead>
       <tbody><tr><td colspan="5" class="muted">Waiting for the first topology scan…</td></tr></tbody>
@@ -1825,12 +1968,12 @@ $HtmlPage = @'
 
   <div class="card sec" data-panel="forecast">
     <h2>Capacity forecast <span class="muted" style="text-transform:none;letter-spacing:0">· days to full</span></h2>
-    <div id="forecastBody"><span class="muted">Needs a few minutes of allocation history before it can say anything.</span></div>
+    <div id="forecastBody" class="pbody" data-pk="forecast" style="height:150px"><span class="muted">Needs a few minutes of allocation history before it can say anything.</span></div>
   </div>
 
   <div class="card sec" id="poolOverviewWrap" data-panel="poolOverview" style="display:none">
     <h2>Storage Pool <span class="muted" style="text-transform:none;letter-spacing:0">· allocation across the pool</span></h2>
-    <div id="poolOverview"></div>
+    <div id="poolOverview" class="pbody" data-pk="poolov" style="height:200px"></div>
   </div>
 
   <div class="grid two sec">
@@ -1873,14 +2016,14 @@ $HtmlPage = @'
 
   <div class="card sec" id="repairWrap" data-panel="repair" style="display:none">
     <h2>Repair &amp; Regeneration <span class="muted" style="text-transform:none;letter-spacing:0">· from Storage Spaces internal counters</span></h2>
-    <div id="repair"></div>
+    <div id="repair" class="pbody" data-pk="repair" style="height:220px"></div>
   </div>
 </section>
 
 <section data-group="cache" hidden>
   <div class="card sec" id="wcWrap" data-panel="writeCache">
     <h2>Storage Spaces Write-back Cache</h2>
-    <div id="wcBody"><span class="muted">No write-back cache instances reported.</span></div>
+    <div id="wcBody" class="pbody" data-pk="wcache" style="height:180px"><span class="muted">No write-back cache instances reported.</span></div>
   </div>
 
   <div class="card sec" data-panel="fileCache">
@@ -1903,7 +2046,35 @@ $HtmlPage = @'
 <section data-group="jobs" hidden>
   <div class="card sec" data-panel="jobs">
     <h2>Active Storage Jobs <span class="muted" style="text-transform:none;letter-spacing:0">· repair, rebalance, tier optimisation</span></h2>
-    <div id="jobs" class="jobsempty">No active storage jobs.</div>
+    <!-- #jobs is wrapped, not itself the .pbody: its render overwrites className,
+         which would strip the pbody class and break resize. -->
+    <div class="pbody" data-pk="jobs" style="height:180px"><div id="jobs" class="jobsempty">No active storage jobs.</div></div>
+  </div>
+</section>
+
+<!-- Composer. Builds a Storage Space configuration and emits the exact command
+     sequence to run — it never executes anything. This keeps the dashboard
+     strictly read-only against the storage stack; you paste the vetted commands
+     into an elevated prompt yourself. Numbers are for STANDALONE Storage Spaces
+     (fault domain = disk), not S2D. -->
+<section data-group="create" hidden>
+  <div class="card sec" data-panel="createBuild">
+    <h2>Storage actions <span class="muted" style="text-transform:none;letter-spacing:0">· create, expand, maintain · builds the commands · never runs them</span></h2>
+    <div id="createBody" class="createwrap">
+      <div class="createform" id="createForm"><!-- built by renderCreate --></div>
+      <div class="createside">
+        <div id="createSummary"></div>
+        <div id="createWarn"></div>
+      </div>
+    </div>
+  </div>
+  <div class="card sec" data-panel="createCmd">
+    <h2>Commands to run <span class="muted" style="text-transform:none;letter-spacing:0">· elevated PowerShell · review before running</span></h2>
+    <div id="createCmdWrap">
+      <div class="pbody" data-pk="createcmd" style="height:300px"><pre id="createCmd" class="cmdblock"></pre></div>
+      <button type="button" id="createCopy" class="ract">copy all</button>
+      <a class="ract" href="https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/deploy-standalone-storage-spaces" target="_blank" rel="noopener noreferrer">docs ↗</a>
+    </div>
   </div>
 </section>
 
@@ -2397,8 +2568,18 @@ function saveOrder(){ try{ localStorage.setItem('ssdash.order',JSON.stringify(pa
 function initPanelOrder(){
   origOrder=panelOrder();                                   // snapshot BEFORE restoring
   let saved=[]; try{ saved=JSON.parse(localStorage.getItem('ssdash.order')||'[]'); }catch(e){}
-  if(saved.length) applyOrder(saved);
-
+  if(saved.length){
+    // MERGE saved order with the current default, don't just replay saved.
+    // applyOrder only re-appends the panels it is handed; a panel that did not
+    // exist when the layout was saved (a new feature — e.g. the bay map) is
+    // therefore never re-appended, and because every saved panel moves to the
+    // end of its container, the new one is left stranded ABOVE them. Appending
+    // unknown panels in their default order puts them back where they belong.
+    const known=new Set(saved);
+    const merged=saved.filter(k=>origOrder.includes(k))
+                      .concat(origOrder.filter(k=>!known.has(k)));
+    applyOrder(merged);
+  }
   document.querySelectorAll('[data-panel]').forEach(addDragHandle);
 }
 function addDragHandle(el){
@@ -3893,6 +4074,356 @@ function renderBayMap(d){
   }
 }
 
+// ---- storage space composer -------------------------------------------------
+// Builds a configuration and emits the exact command sequence. It NEVER runs
+// anything — same read-only contract as the triage remedies. Numbers are for
+// STANDALONE Storage Spaces (fault domain = one disk), not S2D.
+//
+// Minimum-disk figures are the published standalone minimums and are treated as
+// GUIDANCE: the generated New-VirtualDisk is the source of truth and Storage
+// Spaces rejects an invalid layout with a clear error. The composer's job is to
+// get you close and show the geometry, not to be the final arbiter.
+const RESIL = {
+  simple:  { label:'Simple',            min:1, tol:0, resil:'Simple', copies:1, parity:0, eff:()=>1 },
+  mirror2: { label:'Two-way mirror',    min:2, tol:1, resil:'Mirror', copies:2, parity:0, eff:()=>1/2 },
+  mirror3: { label:'Three-way mirror',  min:5, tol:2, resil:'Mirror', copies:3, parity:0, eff:()=>1/3 },
+  parity1: { label:'Single parity',     min:3, tol:1, resil:'Parity', copies:1, parity:1, eff:c=>Math.max(1,c-1)/Math.max(2,c) },
+  parity2: { label:'Dual parity',       min:7, tol:2, resil:'Parity', copies:1, parity:2, eff:c=>Math.max(1,c-2)/Math.max(3,c) },
+};
+const CREATE = {
+  op:'create',                    // create | expand | maintain
+  pool:'Pool1', space:'Space1', mode:'single', resil:'mirror2',
+  ssdResil:'mirror2', hddResil:'parity1', ssdSizeGB:0, hddSizeGB:0,
+  prov:'Thin', cacheGB:0, cols:0, fs:'ReFS', letter:'P', sizeGB:0, label:'',
+  expPool:'', expOptimize:true,   // expand mode
+  mtnTarget:'', mtnAction:'repair'// maintain mode
+};
+
+function createDisks(){
+  const pd=(lastTopoData&&lastTopoData.physicalDisks)||[];
+  const pool=pd.filter(p=>p.canPool && !/^space$/i.test(p.mediaType));
+  const grp={SSD:[],HDD:[],SCM:[],Other:[]};
+  pool.forEach(p=>{ const t=tierOf(p.mediaType)||'Other'; (grp[t]||grp.Other).push(p); });
+  const sum=a=>a.reduce((s,x)=>s+(x.size||0),0);
+  return { all:pool, ssd:grp.SSD, hdd:grp.HDD, scm:grp.SCM,
+           ssdBytes:sum(grp.SSD), hddBytes:sum(grp.HDD),
+           n:pool.length, ssdN:grp.SSD.length, hddN:grp.HDD.length };
+}
+
+// default parity column count from the disks available to that tier
+function parityCols(res, n){
+  if(!RESIL[res].parity) return RESIL[res].copies;
+  const cap = RESIL[res].parity===2 ? 16 : 8;
+  return Math.max(RESIL[res].min===7?7:3, Math.min(n, cap));
+}
+
+function initCreate(){
+  const f=$('#createForm'); if(!f || f._built) return; f._built=true;
+  const seg=(name,opts,cur)=>`<div class="cseg" data-seg="${name}">`+
+    opts.map(([v,l])=>`<button type="button" data-v="${v}" class="${v===cur?'on':''}">${l}</button>`).join('')+`</div>`;
+  const resilOpts=[['simple','Simple'],['mirror2','Two-way'],['mirror3','Three-way'],['parity1','Single parity'],['parity2','Dual parity']];
+  const tierResil=[['mirror2','Two-way'],['mirror3','Three-way'],['parity1','Parity'],['parity2','Dual parity']];
+  f.innerHTML=`
+    <div class="crow"><label>Operation</label>${seg('op',[['create','Create a space'],['expand','Expand a pool'],['maintain','Maintenance']],CREATE.op)}</div>
+    <div id="cf-create" style="display:flex;flex-direction:column;gap:14px">
+      <div class="cinline">
+        <div class="crow"><label>Pool name</label><input type="text" id="cf-pool" value="${esc(CREATE.pool)}"></div>
+        <div class="crow"><label>Space name</label><input type="text" id="cf-space" value="${esc(CREATE.space)}"></div>
+      </div>
+      <div class="crow"><label>Layout</label>${seg('mode',[['single','Single space'],['tiered','Tiered (SSD + HDD)']],CREATE.mode)}</div>
+      <div class="crow" id="cf-single"><label>Resiliency</label>${seg('resil',resilOpts,CREATE.resil)}</div>
+      <div id="cf-tiered" style="display:none;flex-direction:column;gap:14px">
+        <div class="crow"><label>SSD tier (performance)</label>${seg('ssdResil',tierResil,CREATE.ssdResil)}
+          <div class="cinline" style="margin-top:6px"><div class="crow"><label>SSD tier size (GB, 0 = fill)</label><input type="number" id="cf-ssdSize" min="0" value="0"></div></div></div>
+        <div class="crow"><label>HDD tier (capacity)</label>${seg('hddResil',tierResil,CREATE.hddResil)}
+          <div class="cinline" style="margin-top:6px"><div class="crow"><label>HDD tier size (GB, 0 = fill)</label><input type="number" id="cf-hddSize" min="0" value="0"></div></div></div>
+      </div>
+      <div class="cinline">
+        <div class="crow"><label>Provisioning</label>${seg('prov',[['Thin','Thin'],['Fixed','Fixed']],CREATE.prov)}</div>
+        <div class="crow"><label>Write-back cache (GB)</label><input type="number" id="cf-cache" min="0" value="0"></div>
+      </div>
+      <div class="cinline">
+        <div class="crow"><label>Columns (0 = auto)</label><input type="number" id="cf-cols" min="0" value="0"></div>
+        <div class="crow" id="cf-sizeRow"><label>Size (GB, 0 = max)</label><input type="number" id="cf-size" min="0" value="0"></div>
+      </div>
+      <div class="cinline">
+        <div class="crow"><label>Filesystem</label>${seg('fs',[['ReFS','ReFS'],['NTFS','NTFS']],CREATE.fs)}</div>
+        <div class="crow"><label>Drive letter</label><input type="text" id="cf-letter" maxlength="1" value="${esc(CREATE.letter)}" style="width:70px"></div>
+      </div>
+    </div>
+    <div id="cf-expand" style="display:none;flex-direction:column;gap:14px"><!-- built by renderOpForm --></div>
+    <div id="cf-maintain" style="display:none;flex-direction:column;gap:14px"><!-- built by renderOpForm --></div>`;
+
+  // segmented buttons
+  f.querySelectorAll('.cseg').forEach(sg=>sg.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-v]'); if(!b) return;
+    sg.querySelectorAll('button').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+    CREATE[sg.dataset.seg]=b.dataset.v; syncCreate(); updateCreate();
+  }));
+  f.querySelectorAll('input').forEach(inp=>inp.addEventListener('input',()=>{ readCreate(); updateCreate(); }));
+  syncCreate(); updateCreate();
+  const cp=$('#createCopy'); if(cp) cp.addEventListener('click',()=>copyText($('#createCmd').textContent, cp));
+}
+function readCreate(){
+  const v=(id,d)=>{ const e=$(id); return e?e.value:d; };
+  CREATE.pool=v('#cf-pool',CREATE.pool).trim()||'Pool1';
+  CREATE.space=v('#cf-space',CREATE.space).trim()||'Space1';
+  CREATE.cacheGB=+v('#cf-cache',0)||0; CREATE.cols=+v('#cf-cols',0)||0;
+  CREATE.sizeGB=+v('#cf-size',0)||0; CREATE.letter=(v('#cf-letter','P').trim()||'P').toUpperCase().slice(0,1);
+  CREATE.ssdSizeGB=+v('#cf-ssdSize',0)||0; CREATE.hddSizeGB=+v('#cf-hddSize',0)||0;
+}
+function syncCreate(){
+  // operation visibility
+  const op=CREATE.op;
+  const cc=$('#cf-create'), ce=$('#cf-expand'), cm=$('#cf-maintain');
+  if(cc) cc.style.display=op==='create'?'flex':'none';
+  if(ce) ce.style.display=op==='expand'?'flex':'none';
+  if(cm) cm.style.display=op==='maintain'?'flex':'none';
+  // create-mode layout visibility
+  const tiered=CREATE.mode==='tiered';
+  const single=$('#cf-single'), tier=$('#cf-tiered'), sizeRow=$('#cf-sizeRow');
+  if(single) single.style.display=tiered?'none':'';
+  if(tier) tier.style.display=tiered?'flex':'none';
+  if(sizeRow) sizeRow.style.display=tiered?'none':'';   // tiered size comes from tier sizes
+  if(op!=='create') renderOpForm();
+}
+
+// Build the Expand / Maintain sub-forms from live topology. Rebuilds only when
+// the set of pools/vdisks changes (keyed), so a topology tick doesn't reset a
+// dropdown mid-selection.
+let opFormKey=null;
+function renderOpForm(){
+  const pools=(lastTopoData&&lastTopoData.pools)||[];
+  const vds=(lastTopoData&&lastTopoData.virtualDisks)||[];
+  const key=CREATE.op+'|'+pools.map(p=>p.name).join(',')+'|'+vds.map(v=>v.name).join(',');
+  if(key===opFormKey) return;
+  opFormKey=key;
+  const opt=(v,l,cur)=>`<option value="${esc(v)}"${v===cur?' selected':''}>${esc(l)}</option>`;
+
+  if(CREATE.op==='expand'){
+    const el=$('#cf-expand'); if(!el) return;
+    if(!pools.length){ el.innerHTML='<span class="muted">No storage pool found to expand.</span>'; return; }
+    if(!CREATE.expPool || !pools.some(p=>p.name===CREATE.expPool)) CREATE.expPool=pools[0].name;
+    el.innerHTML=`
+      <div class="crow"><label>Pool to expand</label>
+        <select id="cf-expPool">${pools.map(p=>opt(p.name,p.name+'  ('+fmtBytes(p.free)+' free of '+fmtBytes(p.size)+')',CREATE.expPool)).join('')}</select></div>
+      <label class="ctoggle"><input type="checkbox" id="cf-expOpt" ${CREATE.expOptimize?'checked':''}> Rebalance existing data onto the new disks afterwards (Optimize-StoragePool)</label>
+      <div class="cwarnitem ok">Adds every currently poolable disk to the pool. Existing data is safe; a rebalance can take a while on large pools.</div>`;
+    $('#cf-expPool').addEventListener('change',e=>{ CREATE.expPool=e.target.value; updateCreate(); });
+    $('#cf-expOpt').addEventListener('change',e=>{ CREATE.expOptimize=e.target.checked; updateCreate(); });
+  } else if(CREATE.op==='maintain'){
+    const el=$('#cf-maintain'); if(!el) return;
+    const targets=[...pools.map(p=>['pool:'+p.name,'pool · '+p.name]), ...vds.map(v=>['vdisk:'+v.name,'space · '+v.name])];
+    if(!targets.length){ el.innerHTML='<span class="muted">No pool or space found.</span>'; return; }
+    if(!CREATE.mtnTarget || !targets.some(t=>t[0]===CREATE.mtnTarget)) CREATE.mtnTarget=targets[0][0];
+    const actions=[['repair','Repair a degraded / incomplete space'],['scan','Run the ReFS Data Integrity Scan now'],
+                   ['optimize','Rebalance the pool (Optimize-StoragePool)'],['integrity','Enable ReFS integrity streams on a volume'],
+                   ['retire','Retire a failed disk so a repair can start']];
+    el.innerHTML=`
+      <div class="crow"><label>Target</label><select id="cf-mtnTarget">${targets.map(t=>opt(t[0],t[1],CREATE.mtnTarget)).join('')}</select></div>
+      <div class="crow"><label>Action</label><select id="cf-mtnAction">${actions.map(a=>opt(a[0],a[1],CREATE.mtnAction)).join('')}</select></div>`;
+    $('#cf-mtnTarget').addEventListener('change',e=>{ CREATE.mtnTarget=e.target.value; updateCreate(); });
+    $('#cf-mtnAction').addEventListener('change',e=>{ CREATE.mtnAction=e.target.value; updateCreate(); });
+  }
+}
+
+function updateCreate(){
+  const d=createDisks();
+  const gb=n=>n*1073741824;
+  const warn=[], sum=[];
+  const S=(k,v)=>sum.push(`<div class="cstat"><span class="k">${k}</span><b>${v}</b></div>`);
+  let cmds='';
+
+  if(!lastTopoData){ $('#createSummary').innerHTML='<span class="muted">Waiting for the first topology scan…</span>';
+    $('#createWarn').innerHTML=''; $('#createCmd').textContent='# waiting for disk inventory'; return; }
+
+  // ---- Expand / Maintain operate on the EXISTING pool, not the create form.
+  if(CREATE.op!=='create'){
+    renderOpForm();
+    const r = CREATE.op==='expand' ? buildExpand(d) : buildMaintain();
+    $('#createSummary').innerHTML=r.sum.map(x=>`<div class="cstat"><span class="k">${x[0]}</span><b>${esc(x[1])}</b></div>`).join('');
+    $('#createWarn').innerHTML=(r.warn||[]).map(([k,t])=>`<div class="cwarnitem ${k==='ok'?'ok':k==='bad'?'bad':''}">${esc(t)}</div>`).join('');
+    $('#createCmd').innerHTML=r.cmds.split('\n').map(l=>/^\s*#/.test(l)?`<span class="cm">${esc(l)}</span>`:esc(l)).join('\n');
+    return;
+  }
+
+  S('Poolable disks', d.n+'  ('+d.ssdN+' SSD · '+d.hddN+' HDD'+(d.scm.length?(' · '+d.scm.length+' SCM'):'')+')');
+
+  if(CREATE.mode==='single'){
+    const r=RESIL[CREATE.resil];
+    const cols=CREATE.cols>0?CREATE.cols:parityCols(CREATE.resil,d.n);
+    const eff=r.eff(cols);
+    const usable=d.all.length?gb(0)+d.all.reduce((s,x)=>s+(x.size||0),0)*eff:0;
+    S('Resiliency', r.label+' · tolerates '+r.tol+' disk'+(r.tol===1?'':'s')+' lost');
+    S('Storage efficiency', Math.round(eff*100)+'%');
+    S('Raw capacity', fmtBytes(d.all.reduce((s,x)=>s+(x.size||0),0)));
+    S('Usable (approx)', fmtBytes(usable));
+    if(r.parity) S('Columns', cols);
+    if(d.n < r.min) warn.push(['bad', r.label+' needs at least '+r.min+' disks (standalone); you have '+d.n+'. Storage Spaces will reject this.']);
+    else warn.push(['ok', d.n+' disks is enough for '+r.label+' (min '+r.min+').']);
+    cmds=buildCreateSingle(d, r, cols);
+  } else {
+    if(d.ssdN===0||d.hddN===0) warn.push(['bad','A tiered space needs BOTH an SSD tier and an HDD tier. You have '+d.ssdN+' SSD and '+d.hddN+' HDD poolable.']);
+    const sr=RESIL[CREATE.ssdResil], hr=RESIL[CREATE.hddResil];
+    const scol=parityCols(CREATE.ssdResil,d.ssdN), hcol=parityCols(CREATE.hddResil,d.hddN);
+    S('SSD tier', sr.label+' · '+fmtBytes(d.ssdBytes*sr.eff(scol))+' usable of '+fmtBytes(d.ssdBytes));
+    S('HDD tier', hr.label+' · '+fmtBytes(d.hddBytes*hr.eff(hcol))+' usable of '+fmtBytes(d.hddBytes));
+    S('Fault tolerance', 'SSD '+sr.tol+' · HDD '+hr.tol+' disk(s)');
+    if(d.ssdN && d.ssdN<sr.min) warn.push(['bad','SSD tier '+sr.label+' needs '+sr.min+' disks; you have '+d.ssdN+'.']);
+    if(d.hddN && d.hddN<hr.min) warn.push(['bad','HDD tier '+hr.label+' needs '+hr.min+' disks; you have '+d.hddN+'.']);
+    if(!warn.some(w=>w[0]==='bad')) warn.push(['ok','Both tiers have enough disks.']);
+    cmds=buildCreateTiered(d, sr, hr, scol, hcol);
+  }
+  if(CREATE.cacheGB>0) S('Write-back cache', CREATE.cacheGB+' GB (reserved from mirror)');
+  S('Provisioning', CREATE.prov);
+  S('Volume', CREATE.letter+':  ·  '+CREATE.fs);
+
+  $('#createSummary').innerHTML=sum.join('');
+  $('#createWarn').innerHTML=warn.map(([k,t])=>`<div class="cwarnitem ${k==='ok'?'ok':k==='bad'?'bad':''}">${esc(t)}</div>`).join('');
+  // syntax-highlight comment lines
+  $('#createCmd').innerHTML=cmds.split('\n').map(l=>/^\s*#/.test(l)?`<span class="cm">${esc(l)}</span>`:esc(l)).join('\n');
+}
+
+function buildCreateSingle(d, r, cols){
+  const q=s=>"'"+String(s).replace(/'/g,"''")+"'";
+  const L=[];
+  L.push('# Standalone Storage Spaces — single virtual disk. Run ELEVATED. Review first.');
+  L.push('# You have '+d.n+' poolable disk(s). This consumes them.');
+  L.push('$sub  = Get-StorageSubSystem | Where-Object FriendlyName -like "*Windows*" | Select-Object -First 1');
+  L.push('$pool = New-StoragePool -FriendlyName '+q(CREATE.pool)+' -StorageSubSystemUniqueId $sub.UniqueId `');
+  L.push('          -PhysicalDisks (Get-PhysicalDisk -CanPool $true)');
+  L.push('');
+  const args=['-StoragePoolFriendlyName '+q(CREATE.pool), '-FriendlyName '+q(CREATE.space),
+              '-ResiliencySettingName '+q(r.resil)];
+  if(r.resil==='Mirror' && r.copies>1) args.push('-NumberOfDataCopies '+r.copies);
+  if(r.resil==='Parity' && r.parity===2) args.push('-PhysicalDiskRedundancy 2');
+  if(CREATE.cols>0) args.push('-NumberOfColumns '+CREATE.cols);
+  args.push('-ProvisioningType '+CREATE.prov);
+  args.push(CREATE.sizeGB>0 ? ('-Size '+CREATE.sizeGB+'GB') : '-UseMaximumSize');
+  if(CREATE.cacheGB>0) args.push('-WriteCacheSize '+CREATE.cacheGB+'GB');
+  L.push('New-VirtualDisk `');
+  L.push('  '+args.join(' `\n  '));
+  L.push('');
+  L.push(...formatSteps());
+  return L.join('\n');
+}
+function buildCreateTiered(d, sr, hr, scol, hcol){
+  const q=s=>"'"+String(s).replace(/'/g,"''")+"'";
+  const L=[];
+  L.push('# Standalone Storage Spaces — tiered virtual disk (SSD + HDD). Run ELEVATED.');
+  L.push('$sub  = Get-StorageSubSystem | Where-Object FriendlyName -like "*Windows*" | Select-Object -First 1');
+  L.push('$pool = New-StoragePool -FriendlyName '+q(CREATE.pool)+' -StorageSubSystemUniqueId $sub.UniqueId `');
+  L.push('          -PhysicalDisks (Get-PhysicalDisk -CanPool $true)');
+  L.push('');
+  L.push('# Tiers classify drives by MediaType. If any pooled disk reports');
+  L.push('#   MediaType = Unspecified  (check: Get-StoragePool '+q(CREATE.pool)+' | Get-PhysicalDisk)');
+  L.push('# set it before creating tiers, e.g.:');
+  L.push('#   Get-StoragePool '+q(CREATE.pool)+' | Get-PhysicalDisk | Where-Object Size -lt 2TB |');
+  L.push('#     Set-PhysicalDisk -MediaType SSD    # and the rest -MediaType HDD');
+  L.push('');
+  L.push('$ssd = New-StorageTier -StoragePoolFriendlyName '+q(CREATE.pool)+' -FriendlyName '+q(CREATE.space+'_SSD')+' `');
+  L.push('         -MediaType SSD -ResiliencySettingName '+q(sr.resil)+(sr.copies>1?(' -NumberOfDataCopies '+sr.copies):'')+(sr.parity===2?' -PhysicalDiskRedundancy 2':''));
+  L.push('$hdd = New-StorageTier -StoragePoolFriendlyName '+q(CREATE.pool)+' -FriendlyName '+q(CREATE.space+'_HDD')+' `');
+  L.push('         -MediaType HDD -ResiliencySettingName '+q(hr.resil)+(hr.copies>1?(' -NumberOfDataCopies '+hr.copies):'')+(hr.parity===2?' -PhysicalDiskRedundancy 2':''));
+  L.push('');
+  const ssz=CREATE.ssdSizeGB>0?(CREATE.ssdSizeGB+'GB'):'((Get-StorageTierSupportedSize -FriendlyName '+q(CREATE.space+'_SSD')+' -ResiliencySettingName '+q(sr.resil)+').TierSizeMax)';
+  const hsz=CREATE.hddSizeGB>0?(CREATE.hddSizeGB+'GB'):'((Get-StorageTierSupportedSize -FriendlyName '+q(CREATE.space+'_HDD')+' -ResiliencySettingName '+q(hr.resil)+').TierSizeMax)';
+  const args=['-StoragePoolFriendlyName '+q(CREATE.pool),'-FriendlyName '+q(CREATE.space),
+              '-StorageTiers $ssd, $hdd','-StorageTierSizes '+ssz+', '+hsz,'-ProvisioningType '+CREATE.prov];
+  if(CREATE.cacheGB>0) args.push('-WriteCacheSize '+CREATE.cacheGB+'GB');
+  L.push('New-VirtualDisk `');
+  L.push('  '+args.join(' `\n  '));
+  L.push('');
+  L.push(...formatSteps());
+  return L.join('\n');
+}
+function formatSteps(){
+  const q=s=>"'"+String(s).replace(/'/g,"''")+"'";
+  const lbl=CREATE.label||CREATE.space;
+  return [
+    '# Initialize, partition and format the new virtual disk',
+    '$vd   = Get-VirtualDisk '+q(CREATE.space),
+    '$disk = $vd | Get-Disk',
+    'Initialize-Disk -Number $disk.Number -PartitionStyle GPT',
+    'New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter '+CREATE.letter,
+    'Format-Volume -DriveLetter '+CREATE.letter+' -FileSystem '+CREATE.fs+' -NewFileSystemLabel '+q(lbl),
+  ];
+}
+
+// ---- Expand: add poolable disks to an existing pool -------------------------
+function buildExpand(d){
+  const q=s=>"'"+String(s).replace(/'/g,"''")+"'";
+  const pools=(lastTopoData&&lastTopoData.pools)||[];
+  const p=pools.find(x=>x.name===CREATE.expPool)||pools[0];
+  const sum=[], warn=[];
+  if(!p) return {sum:[['','no pool']], warn:[['bad','No pool to expand.']], cmds:'# no pool found'};
+  sum.push(['Pool', p.name]);
+  sum.push(['Current', fmtBytes(p.allocated)+' used of '+fmtBytes(p.size)+'  ('+fmtBytes(p.free)+' free)']);
+  sum.push(['Members', ((p.diskNumbers||[]).length)+' disk(s)']);
+  sum.push(['Poolable now', d.n+'  ('+fmtBytes(d.all.reduce((s,x)=>s+(x.size||0),0))+')']);
+  if(d.n===0) warn.push(['bad','No poolable disks available to add. A disk must show CanPool = true.']);
+  else warn.push(['ok','Adds '+d.n+' disk(s) to '+p.name+'. Existing data is untouched.']);
+
+  const L=[];
+  L.push('# Add poolable disk(s) to an existing pool. Run ELEVATED. Existing data is safe.');
+  L.push('$new = Get-PhysicalDisk -CanPool $true');
+  L.push('Add-PhysicalDisk -StoragePoolFriendlyName '+q(p.name)+' -PhysicalDisks $new');
+  if(CREATE.expOptimize){
+    L.push('');
+    L.push('# Rebalance existing data across the new disks (optional; can run for a while).');
+    L.push('# Progress shows on this dashboard under Jobs.');
+    L.push('Optimize-StoragePool -FriendlyName '+q(p.name));
+  }
+  L.push('');
+  L.push('# To then GROW a thin space and its volume into the new capacity:');
+  L.push('#   Resize-VirtualDisk -FriendlyName <space> -Size <newSize>');
+  L.push('#   $pt = Get-VirtualDisk <space> | Get-Disk | Get-Partition | Where-Object DriveLetter');
+  L.push('#   Resize-Partition -DiskNumber $pt.DiskNumber -PartitionNumber $pt.PartitionNumber `');
+  L.push('#     -Size (Get-PartitionSupportedSize -DiskNumber $pt.DiskNumber -PartitionNumber $pt.PartitionNumber).SizeMax');
+  return {sum, warn, cmds:L.join('\n')};
+}
+
+// ---- Maintain: on-demand repair / scrub / optimize (copy-only) --------------
+function buildMaintain(){
+  const q=s=>"'"+String(s).replace(/'/g,"''")+"'";
+  const [kind,name]=String(CREATE.mtnTarget||'').split(/:(.+)/);
+  const sum=[['Target', (kind==='pool'?'pool ':'space ')+name], ['Action', CREATE.mtnAction]];
+  const warn=[]; const L=[];
+  switch(CREATE.mtnAction){
+    case 'repair':
+      L.push('# Repair a degraded or incomplete space — rebuilds redundancy onto healthy disks.');
+      L.push('# Watch progress under Jobs on this dashboard.');
+      L.push(kind==='vdisk' ? ('Repair-VirtualDisk -FriendlyName '+q(name))
+                            : ('Get-VirtualDisk -StoragePoolFriendlyName '+q(name)+' | Repair-VirtualDisk'));
+      warn.push(['ok','Storage Spaces Direct repairs automatically; standalone needs this run after replacing a drive.']);
+      break;
+    case 'scan':
+      L.push('# Run the ReFS Data Integrity Scan immediately (normally every ~4 weeks).');
+      L.push('# It validates checksummed file data and repairs what it can; results go to the System log.');
+      L.push("Start-ScheduledTask -TaskPath '\\Microsoft\\Windows\\Data Integrity Scan\\' -TaskName 'Data Integrity Scan'");
+      break;
+    case 'optimize':
+      L.push('# Rebalance the pool so data is spread evenly (e.g. after adding disks).');
+      L.push('Optimize-StoragePool -FriendlyName '+q(kind==='pool'?name:'<pool>'));
+      if(kind!=='pool') warn.push(['bad','Pick a POOL as the target for a rebalance, not a space.']);
+      break;
+    case 'integrity':
+      L.push('# Turn ON ReFS integrity streams so file DATA (not just metadata) is checksummed');
+      L.push('# and the scrubber can detect & repair silent corruption. Off by default.');
+      L.push("Set-FileIntegrity '<drive>:\\' -Enable $true          # whole volume");
+      L.push('# or per folder:  Get-Item <path> | Set-FileIntegrity -Enable $true');
+      warn.push(['ok','Existing files keep their current setting; this affects new writes unless you re-copy.']);
+      break;
+    case 'retire':
+      L.push('# Retire a failed/ missing disk so its data is rebuilt elsewhere, then repair.');
+      L.push('Get-PhysicalDisk | Where-Object { $_.OperationalStatus -match ' + q('Lost Communication|Unrecognized|Failed') + ' } |');
+      L.push('  Set-PhysicalDisk -Usage Retired');
+      L.push('Get-VirtualDisk -StoragePoolFriendlyName '+q(kind==='pool'?name:'<pool>')+' | Repair-VirtualDisk');
+      break;
+  }
+  return {sum, warn, cmds:L.join('\n')};
+}
+
 function applyTopoDerived(d){
   const pd=d.physicalDisks||[];
   const healthy=pd.filter(p=>isOkHealth(p.health)).length;
@@ -4143,7 +4674,13 @@ async function getJson(url){
   let r;
   try{ r = await fetch(url); }
   catch(e){ setConn('down','Cannot reach '+url+' — '+(e&&e.message||'network error')); return null; }
-  if(r.status===401){ setConn('authfail','Session expired or key rotated ('+url+')'); return null; }
+  if(r.status===401){
+    // Session gone (key rotated, or never authenticated on this origin). Go to
+    // the login page — reloading serves it, since we're now unauthenticated.
+    setConn('authfail','Session expired — signing in again');
+    if(!window._ssdReauth){ window._ssdReauth=true; setTimeout(()=>location.reload(), 400); }
+    return null;
+  }
   if(!r.ok){ setConn('servererr','HTTP '+r.status+' from '+url+' — this is the dashboard process, not your storage'); return null; }
   try{ return await r.json(); }
   catch(e){ setConn('servererr','Malformed response from '+url); return null; }
@@ -4343,6 +4880,7 @@ async function pollTopology(){
     renderTriage(d, lastPerfData);
     renderTimeline(d);
     renderBayMap(d);
+    if(typeof updateCreate==='function') updateCreate();   // refresh poolable-disk inventory
 
     // tiers
     $('#tiers').innerHTML=d.tiers.length? d.tiers.map(t=>`<div style="display:flex;justify-content:space-between;padding:3px 0">
@@ -4368,6 +4906,7 @@ pollHistory();
 setInterval(pollHistory, 60000);
 loadBays();      // decides whether the bay editor is writable before it renders
 loadAlerts();    // severity overrides must be known before triage first renders
+initCreate();    // storage-space composer form
 // 1Hz is enough to make a stalled feed obvious without adding render churn at
 // the 100ms cadence — and it only touches the DOM when something is actually late.
 setInterval(stampPanelAges, 1000);
@@ -4618,15 +5157,155 @@ function Export-Alerts { Export-JsonMap -Path $script:AlertsPath -Key 'alerts' }
 Import-Bays
 Import-Alerts
 
-$url = "http://localhost:$Port/"
+# ---------------------------------------------------------------------------
+# Network access key.
+#
+# The rule is simple and it is what makes this seamless: LOOPBACK NEVER
+# AUTHENTICATES. If a request comes from the machine itself (console, RDP, the
+# copy-to-a-broken-box path) it is trusted — you have already proven more than a
+# password could. Only requests arriving over the network need the key.
+#
+# The raw key is stored in key.json (a generated sidecar, like bays.json). Yes,
+# plaintext on disk — deliberately: reading that file requires being ON the box,
+# where you would bypass auth anyway, and storing the raw key is what lets every
+# launch (and every bookmark) carry ?k=<key> for one-click entry. The cookie is
+# NOT the raw key: it is an HMAC of it, so a stolen cookie can't be turned back
+# into the key. There is no TLS here by design (trusted-LAN model) — the key,
+# like the whole topology, crosses the wire in the clear.
+# ---------------------------------------------------------------------------
+# (KeyPath / New-AccessKey / Save-AccessKey / Initialize-AccessKey are defined
+# near the top — the daemon installer needs them before anything else runs.)
+#
+# Cookie value: HMAC-SHA256(key, "ssd-session-v1"), base64url. Stable across
+# restarts (derived from the key), so a session never has to re-authenticate.
+function Get-SessionToken { param([string]$K)
+    $h = New-Object System.Security.Cryptography.HMACSHA256 (,[System.Text.Encoding]::UTF8.GetBytes($K))
+    $b = $h.ComputeHash([System.Text.Encoding]::UTF8.GetBytes('ssd-session-v1')); $h.Dispose()
+    [Convert]::ToBase64String($b).TrimEnd('=').Replace('+','-').Replace('/','_')
+}
+# Constant-time string compare — don't leak the key one character at a time.
+function Test-ConstantTime { param([string]$A,[string]$B)
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    $ba=[System.Text.Encoding]::UTF8.GetBytes($A); $bb=[System.Text.Encoding]::UTF8.GetBytes($B)
+    if ($ba.Length -ne $bb.Length) { return $false }
+    $d = 0; for ($i=0; $i -lt $ba.Length; $i++) { $d = $d -bor ($ba[$i] -bxor $bb[$i]) }
+    $d -eq 0
+}
+
+Initialize-AccessKey        # resolves once; persists in key.json across runs
+$script:SessionToken = Get-SessionToken $script:AccessKey
+$script:StartTime = Get-Date
+
+# Reject a request that is neither local, nor cookie-authenticated, nor carrying
+# the key. Returns $true if the caller should STOP (response already sent).
+function Deny-IfUnauthorized {
+    param($Context)
+    if ($Context.Request.IsLocal) { return $false }            # loopback: always allowed
+    $cookie = $Context.Request.Cookies['ssd']
+    if ($cookie -and (Test-ConstantTime $cookie.Value $script:SessionToken)) { return $false }
+    # ?k=<key> — set the cookie and (for a page GET) redirect to a clean URL so
+    # the key doesn't linger in the address bar.
+    $qk = $Context.Request.QueryString['k']
+    if ($qk -and (Test-ConstantTime $qk $script:AccessKey)) {
+        $Context.Response.Headers['Set-Cookie'] =
+            "ssd=$($script:SessionToken); Path=/; HttpOnly; Max-Age=315360000; SameSite=Lax"
+        if ($Context.Request.HttpMethod -eq 'GET' -and $Context.Request.Url.AbsolutePath -eq '/') {
+            $Context.Response.StatusCode = 302
+            $Context.Response.Headers['Location'] = '/'
+            $Context.Response.Close()
+            return $true
+        }
+        return $false
+    }
+    # Unauthorized. Fixed small delay so the key can't be brute-forced quickly.
+    Start-Sleep -Milliseconds 400
+    if ($Context.Request.Url.AbsolutePath -like '/api/*') {
+        Send-Text $Context '{"error":"unauthorized","login":true}' 'application/json' 401
+    } else {
+        Send-Text $Context (Get-LoginPage) 'text/html; charset=utf-8' 401
+    }
+    return $true
+}
+
+function Get-LoginPage {
+    $up = (Get-Date) - $script:StartTime
+    $upStr = if ($up.TotalDays -ge 1) { '{0}d {1:00}:{2:00}' -f [int]$up.TotalDays, $up.Hours, $up.Minutes }
+             else { '{0:00}:{1:00}:{2:00}' -f [int]$up.TotalHours, $up.Minutes, $up.Seconds }
+    $alive = @($script:workers | Where-Object { $_.handle -and -not $_.handle.IsCompleted }).Count
+    # Deliberately shows LIVENESS (host, uptime, collectors), never HEALTH: an
+    # unauthenticated page must not reveal whether the array is in trouble. But
+    # you can see you're at the right box and it's alive before you type.
+    @"
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$($script:HostName) — sign in</title><style>
+:root{color-scheme:light dark}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:#0e1116;color:#e6edf3;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+@media(prefers-color-scheme:light){body{background:#f4f6f9;color:#131a22}}
+.box{width:min(380px,92vw);padding:28px 26px;border:1px solid #2a3140;border-radius:14px;background:#171b22}
+@media(prefers-color-scheme:light){.box{background:#fff;border-color:#d6dce4}}
+h1{font-size:17px;margin:0 0 2px}.host{font-weight:700;letter-spacing:.4px;color:#7cc4ff;text-transform:uppercase}
+.live{font-size:12px;color:#8b98a9;margin:6px 0 20px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:5px}
+label{display:block;font-size:12px;color:#8b98a9;margin-bottom:6px}
+input{width:100%;box-sizing:border-box;background:#0e1116;border:1px solid #2a3140;color:inherit;
+  border-radius:8px;padding:11px 12px;font-family:ui-monospace,Consolas,monospace;font-size:14px;letter-spacing:.5px}
+@media(prefers-color-scheme:light){input{background:#f4f6f9;border-color:#d6dce4}}
+input:focus{outline:2px solid #4aa3ff;outline-offset:1px}
+button{width:100%;margin-top:14px;padding:11px;border:0;border-radius:8px;background:#4aa3ff;color:#04121f;
+  font-weight:700;font-size:14px;cursor:pointer;font-family:inherit}
+.err{color:#f85149;font-size:12.5px;min-height:17px;margin-top:10px}
+.note{font-size:11px;color:#8b98a9;margin-top:16px}
+</style></head><body>
+<form class="box" id="f" autocomplete="on">
+  <h1><span class="host">$($script:HostName)</span></h1>
+  <div class="live"><span class="dot"></span>server up $upStr · $alive collectors running</div>
+  <input type="text" name="username" value="storage" autocomplete="username" style="display:none">
+  <label for="k">Access key</label>
+  <input id="k" name="k" type="password" autocomplete="current-password" autofocus
+    placeholder="XXXXX-XXXXX-XXXXX-XXXXX" spellcheck="false">
+  <button type="submit">Unlock</button>
+  <div class="err" id="e"></div>
+  <div class="note">This machine only. The key is printed in the server's console.</div>
+</form>
+<script>
+var f=document.getElementById('f');
+f.addEventListener('submit',async function(ev){
+  ev.preventDefault();
+  var e=document.getElementById('e'); e.textContent='';
+  try{
+    var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:document.getElementById('k').value})});
+    if(r.ok){ location.href='/'; return; }
+    e.textContent='Incorrect key.';
+  }catch(x){ e.textContent='Could not reach the server.'; }
+});
+</script></body></html>
+"@
+}
+
+$url   = "http://localhost:$Port/"
+# The launch URL carries the key. Locally it isn't needed (loopback is trusted),
+# but it sets the session cookie immediately and gives you a fully-formed URL to
+# bookmark or copy to another machine — the one-click path.
+$keyUrl = "$($url)?k=$($script:AccessKey)"
 Write-Host "`n  Storage Spaces Dashboard is live:" -ForegroundColor Green
 Write-Host "    $url" -ForegroundColor Cyan
-if ($BindAll) { Write-Host "    (also reachable at http://<this-server-ip>:$Port/ )" -ForegroundColor DarkCyan }
 Write-Host ("    realtime {0}ms  ·  topology {1}s  ·  jobs {2}s  ·  wear {3}s  ·  layout {4}s" -f `
     $SampleMs, [int]($TopologyMs/1000), [int]($JobsMs/1000), [int]($WearMs/1000), [int]($LayoutMs/1000)) -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Access key (needed only from other machines):" -ForegroundColor Green
+Write-Host "    $($script:AccessKey)" -ForegroundColor Yellow
+if ($BindAll) {
+    Write-Host "  Bookmark this on another machine for one-click access:" -ForegroundColor Green
+    Write-Host "    http://$($script:HostName):$Port/?k=$($script:AccessKey)" -ForegroundColor Cyan
+    Write-Host "  (no auth or TLS — key and data cross the LAN in the clear; use a trusted network)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  Localhost never needs the key. -BindAll exposes it to the LAN." -ForegroundColor DarkGray
+}
 Write-Host "  Press Ctrl+C to stop.`n" -ForegroundColor DarkGray
 
-if (-not $NoLaunch) { try { Start-Process $url } catch {} }
+if (-not $NoLaunch) { try { Start-Process $keyUrl } catch {} }
 
 try {
     while ($listener.IsListening -and -not $script:Shared['stop']) {
@@ -4643,6 +5322,9 @@ try {
         if (-not $task.IsCompleted) { continue }   # shutting down
         try { $ctx = $task.GetAwaiter().GetResult() } catch { continue }
         try {
+            # Gate BEFORE routing. Loopback is always allowed; a network request
+            # needs a valid cookie or ?k=. Denied requests are answered here.
+            if (Deny-IfUnauthorized $ctx) { continue }
             switch ($ctx.Request.Url.AbsolutePath) {
                 '/'              {
                     $page = $HtmlPage.Replace('__POLL_MS__', "$PollMs").Replace('__TOPO_MS__', "$TopologyMs").Replace('__SYS_MS__', "$SystemMs").Replace('__HOST__', $script:HostName)
@@ -4867,6 +5549,24 @@ try {
                         }
                     } catch {
                         Send-Text $ctx ("{`"ok`":false,`"error`":`"$($_.Exception.Message -replace '"','\"')`"}") 'application/json' 400
+                    }
+                }
+                '/api/login'     {
+                    # The manual login form posts here so the key never lands in
+                    # a URL or history (unlike the ?k= bookmark path). Validates,
+                    # sets the persistent cookie, done.
+                    if ($ctx.Request.HttpMethod -ne 'POST') { Send-Text $ctx '{"error":"POST only"}' 'application/json' 405; break }
+                    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [System.Text.Encoding]::UTF8)
+                    $raw = $reader.ReadToEnd(); $reader.Close()
+                    $ok = $false
+                    try { $ok = Test-ConstantTime ("$(($raw | ConvertFrom-Json).key)").Trim() $script:AccessKey } catch {}
+                    if ($ok) {
+                        $ctx.Response.Headers['Set-Cookie'] =
+                            "ssd=$($script:SessionToken); Path=/; HttpOnly; Max-Age=315360000; SameSite=Lax"
+                        Send-Text $ctx '{"ok":true}' 'application/json'
+                    } else {
+                        Start-Sleep -Milliseconds 400
+                        Send-Text $ctx '{"ok":false}' 'application/json' 401
                     }
                 }
                 '/favicon.ico'   { Send-Text $ctx '' 'image/x-icon' 204 }
